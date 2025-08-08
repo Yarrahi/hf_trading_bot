@@ -1,0 +1,12 @@
+{
+    "DOGE-USDT": {
+        "atr_sl_mult": 0.1,
+        "atr_tp_mult": 0.1,
+        "use_trailing": false,
+        "trailing_offset": 0.005,
+        "scale_out": {
+            "active": false,
+            "sell_percent": 100
+        }
+    }
+}

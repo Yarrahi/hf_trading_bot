@@ -1,0 +1,57 @@
+data/server-backup/
+/trading-bot-env
+*.pyc
+*.csv
+*.log
+*__pycache__/
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# VS Code settings
+.vscode/
+
+# Environment variables
+#.env
+#.env.*
+
+# Logs and output
+*.log
+logs/
+*.out
+*.err
+
+# Docker files
+*.pid
+*.sock
+
+# Trading data
+trading_bot_data/
+*.db
+*.sqlite
+
+# Python-specific
+*.egg-info/
+dist/
+build/
+
+# MacOS
+.DS_Store
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Pytest
+.cache/
+
+# MyPy / Pylint / Coverage
+.mypy_cache/
+.pytest_cache/
+coverage.xml
+htmlcov/

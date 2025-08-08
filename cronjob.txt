@@ -1,0 +1,26 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Beim Neustart
+@reboot cd /app && /usr/local/bin/python -m core.daily_report >> /var/log/cron.log 2>&1
+
+# Tägliches Performance-Dashboard (CSV + Equity-Kurve) um 23:58
+58 23 * * * cd /app && /usr/local/bin/python -c "from core.performance import export_performance_csv, generate_equity_curve_plot; export_performance_csv(); generate_equity_curve_plot()" >> /var/log/cron.log 2>&1
+
+# Täglicher kombinierter Report (Trading + Backtest) um 23:59
+59 23 * * * cd /app && /usr/local/bin/python -m core.daily_report >> /var/log/cron.log 2>&1
+
+# Tägliche Analyse der Trades um 00:05 (nach Report und vor Backup)
+5 0 * * * cd /app && grep -q "MODE=LIVE" .env && /usr/local/bin/python -m tests.analyze_trades >> /var/log/cron.log 2>&1
+
+# Git Backup täglich um 00:10 Uhr (10 Minuten nach Tagesreport)
+10 0 * * * cd /app && /usr/local/bin/python -m core.backup_git >> /var/log/cron.log 2>&1
+
+# Order History leeren täglich um 00:12 Uhr (2 Minuten nach Git Backup)
+12 0 * * * cd /app && grep -q "MODE=LIVE" .env && /usr/local/bin/python -m core.clear_order_history >> /var/log/cron.log 2>&1
+
+# Performance-Update alle 6 Stunden
+0 */6 * * * cd /app && /usr/local/bin/python -m core.performance >> /var/log/cron.log 2>&1
+
+
+

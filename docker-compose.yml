@@ -1,0 +1,14 @@
+
+services:
+  trading_bot:
+    build: .
+    container_name: trading_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+      - ./data/server-backup:/app/data/server-backup
+    working_dir: /app
+    entrypoint: ["/app/entrypoint.sh"]

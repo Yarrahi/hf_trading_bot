@@ -1,0 +1,32 @@
+[
+    {
+        "id": "6895ebd980a96c000757d157",
+        "timestamp": 1754655705,
+        "mode": "LIVE",
+        "symbol": "DOGE-USDT",
+        "side": "BUY",
+        "quantity": 28.1847,
+        "price": 0.22212,
+        "fee": 0.00626,
+        "entry_price": 0.22212,
+        "sl": 0.220137,
+        "tp": 0.225425,
+        "pnl": 0.0,
+        "reason": null
+    },
+    {
+        "id": "6895eef8c268f100070cf3c6",
+        "timestamp": 1754656504,
+        "mode": "LIVE",
+        "symbol": "DOGE-USDT",
+        "side": "SELL",
+        "quantity": 28.1841,
+        "price": 0.22228,
+        "fee": 0.006265,
+        "entry_price": 0.22212,
+        "sl": 0.2224437,
+        "tp": 0.22263629999999998,
+        "pnl": 0.07,
+        "reason": "Manual/Signal Sell"
+    }
+]

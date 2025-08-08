@@ -1,0 +1,52 @@
+{
+    "USDT": {
+        "available": 119.03267239,
+        "hold": 0.0,
+        "balance": 119.03267239
+    },
+    "DOGE": {
+        "available": 28.2658,
+        "hold": 0.0,
+        "balance": 28.2658
+    },
+    "LTC": {
+        "available": 0.01,
+        "hold": 0.0,
+        "balance": 0.01
+    },
+    "XRP": {
+        "available": 0.1606,
+        "hold": 0.0,
+        "balance": 0.1606
+    },
+    "SOL": {
+        "available": 0.0024,
+        "hold": 0.0,
+        "balance": 0.0024
+    },
+    "SUI": {
+        "available": 0.1,
+        "hold": 0.0,
+        "balance": 0.1
+    },
+    "ADA": {
+        "available": 0.12,
+        "hold": 0.0,
+        "balance": 0.12
+    },
+    "TRX": {
+        "available": 0.18,
+        "hold": 0.0,
+        "balance": 0.18
+    },
+    "ETH": {
+        "available": 2.9e-06,
+        "hold": 0.0,
+        "balance": 2.9e-06
+    },
+    "BTC": {
+        "available": 0.0,
+        "hold": 0.0,
+        "balance": 0.0
+    }
+}

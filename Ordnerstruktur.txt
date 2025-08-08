@@ -1,0 +1,43 @@
+hf_trading_bot/
+│
+├── core/                    # Zentrale Bot-Logik (API, Orders, Wallet, Logging, Telegram, Recovery)
+│   ├── order.py
+│   ├── wallet.py
+│   ├── logger.py
+│   ├── kucoin_api.py
+│   ├── telegram_utils.py
+│   ├── recovery.py
+│   └── position.py
+│
+├── strategies/             # Trading-Strategien (RSI, EMA, ATR, Kombinationen)
+│   ├── rsi.py
+│   ├── ema.py
+│   ├── atr.py
+│   └── realtime_engine.py   # Hauptstrategie-Engine (HFT-Loop)
+│
+├── filters/                # Optional: Pattern-Filter, Volumen, Candlestick etc.
+│   ├── pattern_filter.py
+│   └── volume_filter.py
+│
+├── config/                 # Symbol-Konfiguration & Timeframes
+│   ├── symbols.json
+│   └── config.py
+│
+├── data/                   # Alle Logs & Trade-Daten (JSON, CSV, Backups)
+│   ├── trades.json
+│   ├── positions.json
+│   ├── logs/
+│   └── backups/
+│
+├── utils/                  # Helferfunktionen, technische Tools
+│   └── utils.py
+│
+├── tests/                  # Unittests für jedes Modul
+│   └── test_rsi.py
+│
+├── main.py                 # Startpunkt des Bots (optional)
+├── stream_kucoin.py        # Haupt-Runner für Echtzeit-Ticker (WS)
+├── Dockerfile              # Optional: Container für VPS oder Deployment
+├── docker-compose.yml      # Optional: Multi-Service Config
+├── requirements.txt        # Python-Abhängigkeiten
+└── .env                    # API-Keys, Modus, Schwellen, Konfigs
