@@ -153,6 +153,85 @@ def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str =
             log_info(f"📉 Menge durch MAX_TRADE_USDT gekappt: {qty_in} → {cap_base}")
             qty_in = cap_base
 
+    # --- SELL pre-exit guard: clamp to available base balance (avoid 200004) ---
+    if is_live and str(side).lower() == "sell":
+        try:
+            base_ccy = symbol.split('-')[0]
+            avail_base = None
+            if hasattr(api, "get_account_list"):
+                try:
+                    bals = api.get_account_list()
+                except Exception:
+                    bals = None
+                if bals:
+                    for b in bals:
+                        if str(b.get("currency")).upper() == base_ccy.upper() and str(b.get("type", "")).lower() == "trade":
+                            avail_base = float(b.get("available", 0.0))
+                            break
+            if avail_base is not None:
+                sell_margin = float(os.getenv("KUCOIN_SELL_SAFETY_MARGIN", "0.999"))
+                max_sell = avail_base * sell_margin
+                if qty_in > max_sell:
+                    log_info(f"💳 SELL-Menge gekappt durch verfügbare {base_ccy}: {qty_in} → {max_sell}")
+                    qty_in = max(0.0, max_sell)
+        except Exception:
+            pass
+        # --- SELL below minQty/minFunds pre-check ---
+        # Use prepare_order to validate the sell order; if error is about minQty or minFunds, skip sending to API
+        qpx_tmp, qqty_tmp, err_tmp, notional_tmp = prepare_order(symbol, side, price, qty_in)
+        if err_tmp and ("minQty" in err_tmp or "minFunds" in err_tmp):
+            log_info(f"❌ SELL order for {symbol} skipped: {err_tmp} (qty={qty_in})")
+            # record locally as rejected
+            now_ts = int(time.time())
+            order_local = {
+                "id": f"{symbol}-SELL-{now_ts}-belowmin",
+                "timestamp": now_ts,
+                "mode": "LIVE" if is_live else "PAPER",
+                "symbol": symbol,
+                "side": "SELL",
+                "quantity": qty_in,
+                "price": float(price),
+                "fee": 0.0,
+                "entry_price": None,
+                "sl": None,
+                "tp": None,
+                "pnl": 0.0,
+                "reason": "below_min_qty_close",
+                "trade_tags": {"sender": "send_order_prepared", "order_type": "market", "rejected_reason": err_tmp},
+            }
+            try:
+                # Enrich with entry/sl/tp from current LIVE position for proper Telegram/history
+                entry_price_val = None
+                sl_enriched = None
+                tp_enriched = None
+                p = None
+                from core.position import PositionManager
+                pm_tmp = PositionManager(mode="LIVE")
+                data_tmp = pm_tmp.load_positions()
+                for pid, p_ in data_tmp.items():
+                    if p_.get("symbol") == symbol or str(pid).startswith(f"{symbol}__"):
+                        entry_price_val = p_.get("entry_price", None)
+                        sl_enriched = p_.get("sl", None)
+                        tp_enriched = p_.get("tp", None)
+                        p = p_
+                        break
+                if order_local.get("entry_price") in (None, 0):
+                    order_local["entry_price"] = entry_price_val
+                if order_local.get("sl") in (None, 0):
+                    order_local["sl"] = sl_enriched
+                if order_local.get("tp") in (None, 0):
+                    order_local["tp"] = tp_enriched
+            except Exception:
+                pass
+            record_order(order_local)
+            # Close the position via PositionManager without calling the API
+            try:
+                from core.position import PositionManager
+                pm = PositionManager(mode="LIVE")
+                pm.close(symbol, reason="below_min_qty_close")
+            except Exception:
+                pass
+            return {"status": "rejected_local", "reason": err_tmp, "symbol": symbol, "side": side, "price": str(qpx_tmp), "qty": str(qqty_tmp)}
     # 1) Precision + Constraints prüfen (nach Normalisierung)
     qpx, qqty, err, notional = prepare_order(symbol, side, price, qty_in)
     if err:
@@ -230,24 +309,49 @@ def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str =
                     return trade.create_limit_order(symbol=symbol, side=side, price=str(qpx), size=str(qqty), client_oid=oid)
             raise AttributeError("No compatible limit-order method found on KuCoin client")
 
-        def _submit_market():
+        def _submit_market(size_override=None):
+            # Use size_override if provided, otherwise qqty
+            use_size = qqty if size_override is None else size_override
             # 1) Wrapper method
             if hasattr(api, "create_market_order"):
                 try:
-                    return api.create_market_order(symbol, side, size=str(qqty))
+                    return api.create_market_order(symbol, side, size=str(use_size))
                 except TypeError:
-                    return api.create_market_order(symbol=symbol, side=side, size=str(qqty))
+                    return api.create_market_order(symbol=symbol, side=side, size=str(use_size))
             # 2) Generic place_order on wrapper
             if hasattr(api, "place_order"):
-                return api.place_order(symbol=symbol, side=side, size=str(qqty), order_type="market")
+                return api.place_order(symbol=symbol, side=side, size=str(use_size), order_type="market")
             # 3) trade client
             trade = getattr(api, "trade", None)
             if trade and hasattr(trade, "create_market_order"):
-                return trade.create_market_order(symbol=symbol, side=side, size=str(qqty))
+                return trade.create_market_order(symbol=symbol, side=side, size=str(use_size))
             raise AttributeError("No compatible market-order method found on KuCoin client")
 
         if order_type == "market":
-            resp = _submit_market()
+            if str(side).lower() == "sell" and is_live:
+                # Retry loop for SELL with downsize on insufficient balance
+                resp = None
+                attempt_qty = float(qqty)
+                for attempt in range(1, 4):
+                    try:
+                        resp = _submit_market(size_override=attempt_qty)
+                        if not (isinstance(resp, dict) and "code" in resp and str(resp["code"]) == "200004"):
+                            break
+                    except Exception as e_sub:
+                        err_str = str(e_sub)
+                        if "200004" not in err_str:
+                            break
+                    # Downsize by 5% and re-round
+                    attempt_qty *= 0.95
+                    qpx2, qqty2, err2, _ = prepare_order(symbol, side, qpx, attempt_qty)
+                    if err2:
+                        log_info(f"❌ Abbruch SELL-Retry {attempt}: {err2}")
+                        break
+                    attempt_qty = qqty2
+                    log_info(f"🔄 SELL-Retry {attempt}: Menge reduziert auf {attempt_qty}")
+                qqty = attempt_qty
+            else:
+                resp = _submit_market()
         else:
             resp = _submit_limit()
 
@@ -670,12 +774,14 @@ def record_order(order, position=None):
             "trade_tags": order.get("trade_tags", {}),
         }
 
-        # --- PNL Berechnung für SELL Orders ---
+        # --- Enhanced PNL Berechnung für SELL Orders ---
         if trade["side"] == "SELL" and (trade.get("pnl") is None or trade.get("pnl_usdt") is None):
             try:
                 entry_price = 0
+                entry_fee_val = 0.0
                 if position:
                     entry_price = position.get("entry_price", 0)
+                    entry_fee_val = float(position.get("entry_fee", position.get("fee", 0.0)) or 0.0)
                 if not entry_price:
                     # Fallback: letzte passende BUY Order laden
                     from core.utils import load_json_file
@@ -684,13 +790,40 @@ def record_order(order, position=None):
                     buy_entry = find_last_matching_buy(trade["symbol"], trade["quantity"], history)
                     if buy_entry:
                         entry_price = buy_entry.get("price", 0)
+                        entry_fee_val = float(buy_entry.get("entry_fee", buy_entry.get("fee", 0.0)) or 0.0)
                 exit_price = trade.get("price", 0)
-                if entry_price and exit_price:
-                    abs_pnl = (exit_price - entry_price) * trade.get("quantity", 0)
+                qty = trade.get("quantity", 0)
+                sell_fee = float(trade.get("fee", 0.0) or 0.0)
+                # Attempt to prorate entry_fee for partial sells (if possible)
+                # Find current position (if any) for proration
+                total_pos_qty = None
+                if not position:
+                    # Try to load from current positions
+                    try:
+                        from core.position import PositionManager
+                        pm_bf = PositionManager(mode="LIVE")
+                        data_bf = pm_bf.load_positions()
+                        sym_bf = trade.get("symbol")
+                        for pid_bf, p_bf in data_bf.items():
+                            if p_bf.get("symbol") == sym_bf or str(pid_bf).startswith(f"{sym_bf}__"):
+                                total_pos_qty = float(p_bf.get("quantity", 0))
+                                if entry_fee_val == 0.0:
+                                    entry_fee_val = float(p_bf.get("entry_fee", p_bf.get("fee", 0.0)) or 0.0)
+                                break
+                    except Exception:
+                        pass
+                else:
+                    total_pos_qty = float(position.get("quantity", 0))
+                # Prorate entry_fee
+                prorated_entry_fee = entry_fee_val
+                if total_pos_qty and total_pos_qty > 0 and qty and qty > 0:
+                    prorated_entry_fee = entry_fee_val * (qty / total_pos_qty)
+                # PnL calc
+                if entry_price and exit_price and qty:
+                    abs_pnl = (exit_price - entry_price) * qty - (sell_fee + prorated_entry_fee)
                     pct_pnl = ((exit_price - entry_price) / entry_price) * 100
-                    trade["pnl"] = round(pct_pnl, 2)
-                    if trade.get("pnl_usdt") is None:
-                        trade["pnl_usdt"] = round(abs_pnl, 4)
+                    trade["pnl"] = round(pct_pnl, 4)
+                    trade["pnl_usdt"] = round(abs_pnl, 6)
             except Exception as e:
                 from core.logger import log_error
                 log_error(f"❌ Fehler bei PNL-Berechnung in record_order: {e}")

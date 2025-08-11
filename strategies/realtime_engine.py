@@ -26,8 +26,10 @@ USE_ATR_STOP = os.getenv("USE_ATR_STOP", "False").lower() == "true"
 ATR_MULTIPLIER_SL = float(os.getenv("ATR_MULTIPLIER_SL", 1.5))
 ATR_MULTIPLIER_TP = float(os.getenv("ATR_MULTIPLIER_TP", 3.0))
 TRAILING_UPDATE_COOLDOWN = int(os.getenv("TRAILING_UPDATE_COOLDOWN", 600))
+DYNAMIC_POSITION_SIZING = os.getenv("DYNAMIC_POSITION_SIZING", "false").lower() == "true"
 SCALE_OUT_THRESHOLD = float(os.getenv("SCALE_OUT_THRESHOLD", 0.01))
 SCALE_OUT_RATIO = float(os.getenv("SCALE_OUT_RATIO", 0.5))
+USE_TRAILING_SL = os.getenv("USE_TRAILING_SL", "false").lower() == "true"
 DYNAMIC_POSITION_SIZING = os.getenv("DYNAMIC_POSITION_SIZING", "false").lower() == "true"
 MAX_TRADE_RISK = float(os.getenv("MAX_TRADE_RISK", 0.01))
 REENTRY_COOLDOWN = int(os.getenv("REENTRY_COOLDOWN", 120))
@@ -59,6 +61,7 @@ last_trailing_update_time = {}
 last_analysis_log_time = 0
 last_ticker_log_time = 0
 last_position_log_time = 0
+entry_counts = {}
 
 # Load optimized params
 try:
@@ -183,13 +186,21 @@ def on_new_price(symbol: str, price: float, *_):
         last_price = price_buffers[symbol][-2]
         price_change = (price - last_price) / last_price
         log.debug(f"📊 Preisänderung für {symbol}: {price_change:.4%}")
+        # --- Symbol-spezifische Settings laden ---
+        pair_settings = OPTIMIZED_PARAMS.get(symbol, {})
+        symbol_reentry_cd = pair_settings.get("reentry_cooldown", REENTRY_COOLDOWN)
+        symbol_max_conc = pair_settings.get("max_concurrent_positions", 1)
+        # --- Max concurrent positions check ---
+        if entry_counts.get(symbol, 0) >= symbol_max_conc:
+            log.info(f"🚫 Max concurrent positions erreicht für {symbol} (Limit: {symbol_max_conc})")
+            return
         # --- Re-Entry Cooldown check ---
         now_ts = time.time()
         last_entry_ts = last_entry_times.get(symbol, 0)
         last_exit_ts = last_exit_times.get(symbol, 0)
         last_activity_ts = max(last_entry_ts, last_exit_ts)
-        if now_ts - last_activity_ts < REENTRY_COOLDOWN:
-            wait_left = int(REENTRY_COOLDOWN - (now_ts - last_activity_ts))
+        if now_ts - last_activity_ts < symbol_reentry_cd:
+            wait_left = int(symbol_reentry_cd - (now_ts - last_activity_ts))
             log.info(f"⏳ Re-Entry Cooldown aktiv für {symbol}: noch {wait_left}s")
             return
         # Impulsschwelle für BUY (z. B. 0.0005 = 0.05 %) – konfigurierbar über .env
@@ -279,6 +290,8 @@ def on_new_price(symbol: str, price: float, *_):
                 # Nur wenn Order wirklich an die Börse gesendet/akzeptiert wurde
                 if status in {"sent", "ack", "filled", "open"} or exch_id:
                     last_entry_times[symbol] = time.time()
+                    # === entry_counts erhöhen ===
+                    entry_counts[symbol] = entry_counts.get(symbol, 0) + 1
                     entry_price = float(response.get("price", price))
                     sl_offset = float(os.getenv("TRAILING_SL_OFFSET", 0.005))
                     tp_offset = float(os.getenv("TRAILING_TP_OFFSET", 0.02))
@@ -307,7 +320,7 @@ def on_new_price(symbol: str, price: float, *_):
                     log.info(f"🧯 BUY-Signal verworfen oder dupliziert – status={status}, response={response}")
 
     # === Trailing Stop-Loss / Take-Profit ===
-    if position_manager.has_open_position(symbol):
+    if USE_TRAILING_SL and position_manager.has_open_position(symbol):
         position = position_manager.get_open_position(symbol)
         entry_price = position.get("entry_price")
         quantity = position.get("quantity")
@@ -331,7 +344,14 @@ def on_new_price(symbol: str, price: float, *_):
         last_update = last_trailing_update_time.get(symbol, 0)
         now = time.time()
 
+        log.info(
+            f"🚦 Starte Trailing-Logic für {symbol} | Aktueller SL: {current_sl} | Aktueller TP: {current_tp} | Cooldown: {cooldown}s"
+        )
+
         if now - last_update >= cooldown:
+            log.info(
+                f"⏱️ Trailing-Cooldown für {symbol} abgelaufen (letztes Update vor {int(now - last_update)}s). Berechne neue SL/TP..."
+            )
             # Neuen SL & TP berechnen basierend auf aktuellem Preis und ATR
             try:
                 kline_data = safe_get_candles(symbol, interval="15min", limit=50)
@@ -345,14 +365,33 @@ def on_new_price(symbol: str, price: float, *_):
                 new_sl = max(current_sl or 0, price - price * trailing_sl_offset)
                 new_tp = max(current_tp or 0, price + price * trailing_tp_offset)
 
+            log.info(
+                f"🔢 Berechnete neue Werte für {symbol}: new_sl={new_sl} (alt: {current_sl}), new_tp={new_tp} (alt: {current_tp})"
+            )
+
             # Nur updaten, wenn näher am Kurs (Long)
             if new_sl > (current_sl or 0):
                 position_manager.update_sl(symbol, new_sl)
                 log.info(f"🔄 SL für {symbol} aktualisiert auf {new_sl}")
+                send_telegram_message(
+                    f"🔄 Trailing SL aktualisiert\nSymbol: {symbol}\nNeuer SL: {new_sl:.5f}",
+                    to_private=True,
+                    to_channel=False
+                )
             if new_tp > (current_tp or 0):
                 position_manager.update_tp(symbol, new_tp)
                 log.info(f"🔄 TP für {symbol} aktualisiert auf {new_tp}")
+                send_telegram_message(
+                    f"🔄 Trailing TP aktualisiert\nSymbol: {symbol}\nNeuer TP: {new_tp:.5f}",
+                    to_private=True,
+                    to_channel=False
+                )
             last_trailing_update_time[symbol] = now
+        else:
+            seconds_left = int(cooldown - (now - last_update))
+            log.info(
+                f"⏳ Trailing-Update für {symbol} übersprungen – Cooldown aktiv, noch {seconds_left}s verbleibend."
+            )
 
     # === Check Take-Profit / Stop-Loss für offene Positionen ===
     if position_manager.has_open_position(symbol):
@@ -373,6 +412,8 @@ def on_new_price(symbol: str, price: float, *_):
                 exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
                 if status in {"sent", "ack", "filled", "open"} or exch_id:
                     last_exit_times[symbol] = time.time()
+                    # === entry_counts zurücksetzen ===
+                    entry_counts[symbol] = 0
                     if not IS_PAPER:
                         position_manager.close_position(symbol)
                     if mode.upper() == "LIVE":
@@ -426,6 +467,8 @@ def on_new_price(symbol: str, price: float, *_):
                 exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
                 if status in {"sent", "ack", "filled", "open"} or exch_id:
                     last_exit_times[symbol] = time.time()
+                    # === entry_counts zurücksetzen ===
+                    entry_counts[symbol] = 0
                     if not IS_PAPER:
                         position_manager.close_position(symbol)
                     if mode.upper() == "LIVE":

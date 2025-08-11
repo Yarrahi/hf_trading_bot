@@ -1,33 +1,13 @@
 {
-    "DOGE-USDT": {
-        "atr_sl_mult": 0.1,
-        "atr_tp_mult": 0.1,
-        "use_trailing": false,
-        "trailing_offset": 0.005,
-        "scale_out": {
-            "active": false,
-            "sell_percent": 1.0
-        }
-    },
-    "BTC-USDT": {
-        "tp": 0.003,
-        "sl": 0.002,
-        "atr_sl_mult": 0.10,
-        "atr_tp_mult": 0.10,
-        "use_trailing": false,
-        "trailing_offset": 0.005,
-        "scale_out": {
-            "active": true,
-            "sell_percent": 0.5
-        }
-    },
     "ETH-USDT": {
         "tp": 0.003,
         "sl": 0.002,
         "atr_sl_mult": 0.10,
         "atr_tp_mult": 0.10,
-        "use_trailing": false,
-        "trailing_offset": 0.005,
+        "use_trailing": true,
+        "trailing_offset": 0.002,
+        "reentry_cooldown": 60,
+        "max_concurrent_positions": 2,
         "scale_out": {
             "active": true,
             "sell_percent": 0.5

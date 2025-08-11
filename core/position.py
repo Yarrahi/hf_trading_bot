@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 load_dotenv()
 DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
+# KuCoin filter import
+from core.kucoin_api import get_symbol_filters
+
 # Logger imports
 from core.logger import log_debug, log_info, log_warning, log_error
 
@@ -285,6 +288,46 @@ class PositionManager:
     def close_position(self, symbol: str) -> None:
         """Alias für close() – für Kompatibilität mit SELL-Logik."""
         self.close(symbol)
+
+    def reduce_position(self, symbol: str, reduce_qty: float) -> bool:
+        """
+        Reduziert die Menge einer offenen Position für das angegebene Symbol um reduce_qty.
+        Wenn die verbleibende Menge <= 0 oder unter minQty ist, wird die Position gelöscht.
+        Gibt True zurück, wenn eine Position angepasst oder entfernt wurde, sonst False.
+        """
+        positions = self.load_positions()
+        found = False
+        for pos_id, pos in list(positions.items()):
+            # Suche per Key-Prefix oder symbol-Feld
+            if pos.get("symbol") == symbol or pos_id.startswith(f"{symbol}__"):
+                old_qty = float(pos.get("quantity", 0.0))
+                new_qty = old_qty - float(reduce_qty)
+                # KuCoin minQty check
+                filters = get_symbol_filters(symbol)
+                min_qty = 0.0
+                if filters and "baseMinSize" in filters:
+                    try:
+                        min_qty = float(filters["baseMinSize"])
+                    except Exception:
+                        min_qty = 0.0
+                if new_qty <= 0 or (min_qty > 0 and new_qty < min_qty):
+                    del positions[pos_id]
+                    if min_qty > 0 and new_qty < min_qty and new_qty > 0:
+                        log_info(f"🗑️ Position vollständig geschlossen durch Reduktion: {symbol} | Alt: {old_qty} | Reduktion: {reduce_qty} | Grund: Restmenge ({new_qty}) unter minQty ({min_qty})")
+                    else:
+                        log_info(f"🗑️ Position vollständig geschlossen durch Reduktion: {symbol} | Alt: {old_qty} | Reduktion: {reduce_qty}")
+                else:
+                    pos["quantity"] = new_qty
+                    positions[pos_id] = pos
+                    log_info(f"🔽 Position reduziert: {symbol} | Alt: {old_qty} | Neu: {new_qty} | Abgezogen: {reduce_qty}")
+                found = True
+                # Nur eine Position pro Symbol reduzieren (wie close), falls mehrere existieren, nur die erste
+                break
+        if found:
+            self._save(positions)
+        else:
+            log_info(f"ℹ️ Keine Position für {symbol} gefunden zum Reduzieren.")
+        return found
 
     def update_sl(self, symbol: str, new_sl: float) -> bool:
         """

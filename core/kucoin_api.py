@@ -264,6 +264,62 @@ class KuCoinClientWrapper:
             logger.info(f"⚠️ Fehler beim Abrufen der offenen Orders für {symbol}: {e}")
             return []
 
+    def get_fills(self, order_id: str = None, symbol: str = None):
+        """
+        Wrapper to fetch fills for a given orderId (and optional symbol).
+        Normalizes different SDK parameter names and routes via safe_api_call.
+        """
+        if RUNTIME_MODE != "LIVE":
+            logger.info("ℹ️ PAPER-Mode: get_fills übersprungen – gebe leere Liste zurück.")
+            return []
+        try:
+            # Prefer explicit orderId param as per KuCoin REST
+            if order_id:
+                try:
+                    return safe_api_call(self.trade.get_fills, orderId=order_id, symbol=symbol)
+                except TypeError:
+                    # Some SDK variants use snake_case
+                    return safe_api_call(self.trade.get_fills, order_id=order_id, symbol=symbol)
+            # If no order_id, fallback to symbol-only (recent fills)
+            if symbol:
+                return safe_api_call(self.trade.get_fills, symbol=symbol)
+            # Nothing to query
+            return []
+        except Exception as e:
+            logger.info(f"⚠️ Fehler beim Abrufen der Fills (orderId={order_id}, symbol={symbol}): {e}")
+            return []
+
+    def get_order(self, order_id: str = None, client_oid: str = None):
+        """
+        Wrapper to fetch order details by KuCoin orderId or clientOid.
+        Tries multiple SDK methods for compatibility.
+        """
+        if RUNTIME_MODE != "LIVE":
+            logger.info("ℹ️ PAPER-Mode: get_order übersprungen – gebe leeres Dict zurück.")
+            return {}
+        try:
+            if client_oid:
+                try:
+                    return safe_api_call(self.trade.get_order_by_client_oid, clientOid=client_oid)
+                except TypeError:
+                    return safe_api_call(self.trade.get_order_by_client_oid, client_oid=client_oid)
+            if order_id:
+                # Try common method names in order
+                try:
+                    return safe_api_call(self.trade.get_order_details, orderId=order_id)
+                except Exception:
+                    try:
+                        return safe_api_call(self.trade.get_order_details, order_id=order_id)
+                    except Exception:
+                        try:
+                            return safe_api_call(self.trade.get_order, orderId=order_id)
+                        except Exception:
+                            return safe_api_call(self.trade.get_order, order_id=order_id)
+            return {}
+        except Exception as e:
+            logger.info(f"⚠️ Fehler beim Abrufen der Orderdetails (orderId={order_id}, clientOid={client_oid}): {e}")
+            return {}
+
 
     def get_symbols(self):
         """
@@ -430,6 +486,12 @@ def get_open_positions(symbols: list = None):
 def get_live_account_balances():
     return kucoin_client.get_live_account_balances()
 
+# Convenience helpers for fills and order details
+def get_fills(order_id: str = None, symbol: str = None):
+    return kucoin_client.get_fills(order_id=order_id, symbol=symbol)
+
+def get_order(order_id: str = None, client_oid: str = None):
+    return kucoin_client.get_order(order_id=order_id, client_oid=client_oid)
 
 # Utility-Funktion für aktuellen Preis
 def get_price(symbol: str) -> float:
@@ -455,6 +517,38 @@ def get_last_ws_price(symbol: str) -> float:
         return get_last_ws_price(symbol)
     except:
         return 0.0
+
+# --- Utility: Get symbol filters for a specific symbol ---
+def get_symbol_filters(symbol: str):
+    """
+    Returns a dict of filter values for the given symbol from KuCoin, or empty dict if not found.
+    {
+      "baseMinSize": float or None,
+      "baseIncrement": float or None,
+      "priceIncrement": float or None,
+      "minFunds": float or None
+    }
+    """
+    try:
+        all_symbols = kucoin_client.get_symbols()
+        for entry in all_symbols or []:
+            sym = (entry.get("symbol") or "").upper()
+            if sym == symbol.upper():
+                def safe_float(val):
+                    try:
+                        return float(val)
+                    except Exception:
+                        return None
+                return {
+                    "baseMinSize": safe_float(entry.get("baseMinSize")),
+                    "baseIncrement": safe_float(entry.get("baseIncrement")),
+                    "priceIncrement": safe_float(entry.get("priceIncrement")),
+                    "minFunds": safe_float(entry.get("minFunds")),
+                }
+        return {}
+    except Exception as e:
+        logger.warning(f"Fehler beim Abrufen von Symbol-Filtern für {symbol}: {e}")
+        return {}
 
 # Beim Modulimport Cache invalidieren
 clear_api_caches()
