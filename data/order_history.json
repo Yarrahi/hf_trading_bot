@@ -30,5 +30,37 @@
         "pnl": -0.03,
         "pnl_usdt": -0.0016,
         "reason": "impulse"
+    },
+    {
+        "id": "6899d1cf2a407800072c001b",
+        "timestamp": 1754911185,
+        "mode": "LIVE",
+        "symbol": "ETH-USDT",
+        "side": "BUY",
+        "quantity": 0.0011614,
+        "price": 4218.56,
+        "fee": 0.0,
+        "entry_price": 4218.56,
+        "sl": 4176.3744,
+        "tp": 4345.1168,
+        "pnl": 0.0,
+        "pnl_usdt": null,
+        "reason": "impulse"
+    },
+    {
+        "id": "6899d23d5194ae00071796ef",
+        "timestamp": 1754911293,
+        "mode": "LIVE",
+        "symbol": "ETH-USDT",
+        "side": "SELL",
+        "quantity": 0.0011614,
+        "price": 4216.38,
+        "fee": 0.0048969,
+        "entry_price": 4218.56,
+        "sl": 4217.0493893,
+        "tp": 4220.6106107,
+        "pnl": -0.05,
+        "pnl_usdt": -0.0025,
+        "reason": "impulse"
     }
 ]

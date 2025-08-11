@@ -1,11 +1,11 @@
 [
     {
-        "pnl": 0.0,
+        "pnl": -0.03,
         "hit_rate": 0.0,
-        "drawdown": 0.0,
-        "num_trades": 0,
+        "drawdown": 0.03,
+        "num_trades": 2,
         "num_wins": 0,
-        "num_losses": 0,
+        "num_losses": 1,
         "date": "2025-08-11"
     }
 ]

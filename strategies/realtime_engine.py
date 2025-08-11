@@ -54,6 +54,7 @@ price_buffers = {}
 last_price_time = {}
 last_signal_attempt = {}
 last_exit_times = {}
+last_entry_times = {}
 last_trailing_update_time = {}
 last_analysis_log_time = 0
 last_ticker_log_time = 0
@@ -182,6 +183,15 @@ def on_new_price(symbol: str, price: float, *_):
         last_price = price_buffers[symbol][-2]
         price_change = (price - last_price) / last_price
         log.debug(f"📊 Preisänderung für {symbol}: {price_change:.4%}")
+        # --- Re-Entry Cooldown check ---
+        now_ts = time.time()
+        last_entry_ts = last_entry_times.get(symbol, 0)
+        last_exit_ts = last_exit_times.get(symbol, 0)
+        last_activity_ts = max(last_entry_ts, last_exit_ts)
+        if now_ts - last_activity_ts < REENTRY_COOLDOWN:
+            wait_left = int(REENTRY_COOLDOWN - (now_ts - last_activity_ts))
+            log.info(f"⏳ Re-Entry Cooldown aktiv für {symbol}: noch {wait_left}s")
+            return
         # Impulsschwelle für BUY (z. B. 0.0005 = 0.05 %) – konfigurierbar über .env
         IMPULSE_THRESHOLD = float(os.getenv("IMPULSE_THRESHOLD", 0.001))
 
@@ -268,6 +278,7 @@ def on_new_price(symbol: str, price: float, *_):
                 exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
                 # Nur wenn Order wirklich an die Börse gesendet/akzeptiert wurde
                 if status in {"sent", "ack", "filled", "open"} or exch_id:
+                    last_entry_times[symbol] = time.time()
                     entry_price = float(response.get("price", price))
                     sl_offset = float(os.getenv("TRAILING_SL_OFFSET", 0.005))
                     tp_offset = float(os.getenv("TRAILING_TP_OFFSET", 0.02))
@@ -361,6 +372,7 @@ def on_new_price(symbol: str, price: float, *_):
                 status = str(response.get("status", "")).lower()
                 exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
                 if status in {"sent", "ack", "filled", "open"} or exch_id:
+                    last_exit_times[symbol] = time.time()
                     if not IS_PAPER:
                         position_manager.close_position(symbol)
                     if mode.upper() == "LIVE":
@@ -413,6 +425,7 @@ def on_new_price(symbol: str, price: float, *_):
                 status = str(response.get("status", "")).lower()
                 exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
                 if status in {"sent", "ack", "filled", "open"} or exch_id:
+                    last_exit_times[symbol] = time.time()
                     if not IS_PAPER:
                         position_manager.close_position(symbol)
                     if mode.upper() == "LIVE":
