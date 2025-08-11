@@ -2,11 +2,15 @@ import os
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
+
 import argparse
 from dotenv import load_dotenv
 import json
 import threading
 import time
+
+from core.orders_db import get_db
+from core.kucoin_api import refresh_symbol_filters
 
 from core.logger import logger
 from core.telegram_utils import send_telegram_message, send_position_summary
@@ -34,6 +38,18 @@ def main():
     ATR_MULTIPLIER_TP = float(os.getenv("ATR_MULTIPLIER_TP", 3.0))
     REENTRY_COOLDOWN = int(os.getenv("REENTRY_COOLDOWN", 120))
     logger.info(f"Bot-Startparameter: ATR_STOP={USE_ATR_STOP}, SL-Multiplier={ATR_MULTIPLIER_SL}, TP-Multiplier={ATR_MULTIPLIER_TP}, ReEntryCooldown={REENTRY_COOLDOWN}s")
+    from core.ids import DEFAULT_BUCKET_MS
+    logger.info(f"Idempotency bucket: {DEFAULT_BUCKET_MS} ms")
+
+    # === Phase 1 Init: Idempotenz-DB + Symbol-Filter ===
+    get_db()
+    try:
+        # KuCoin-Client instanzieren wie im Stream-Code und Filter laden
+        from core.kucoin_api import KuCoinClientWrapper
+        api_client = KuCoinClientWrapper()
+        refresh_symbol_filters(api_client)
+    except Exception as e:
+        logger.warning(f"⚠️ KuCoin-Symbolfilter konnten nicht geladen werden: {e}")
 
     # === 3. Konfiguration prüfen ===
     mode = run_context

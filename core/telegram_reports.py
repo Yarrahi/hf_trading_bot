@@ -1,6 +1,4 @@
 
-
-
 from core.telegram_utils import send_telegram_message
 
 def send_position_summary(positions: list):

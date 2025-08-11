@@ -49,6 +49,9 @@ def run_with_timeout(func, args=(), kwargs={}, timeout=10):
     return result[0]
 from core.wallet import Wallet, notify_live_balance, wallet_instance, safe_update_balance
 from core.wallet import get_live_balance
+from core.filters import prepare_order
+from core.ids import make_client_oid
+from core.orders_db import get_db
 
 import uuid
 
@@ -81,6 +84,365 @@ class OrderHandler:
             position_manager=position_manager,
             entry_reason=entry_reason,
         )
+
+# === Phase 1: unified, idempotent order sender ===
+def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str = "default", order_type: str = "market"):
+    """
+    Einheitlicher Order-Send mit:
+      - Runden via FilterBook (prepare_order)
+      - minFunds/minQty-Prüfung
+      - Idempotenz via SQLite (clientOid)
+      - Fallback: get_order_by_client_oid() bei Timeout/Netzwerkfehler
+    Rückgabe: API-Response (dict) erweitert um clientOid, oder Local-Reject-Dict.
+    """
+    # Force SELL to use MARKET to avoid SL/TP rejections (e.g., 200004) on tight moves
+    if str(side).lower() == "sell":
+        order_type = "market"
+    # --- Normalize qty for LIVE BUY: handle quote-amount (USDT) and cap by available funds ---
+    try:
+        runtime_mode = (os.getenv("RUNTIME_MODE") or get_config("MODE") or "PAPER").upper()
+    except Exception:
+        runtime_mode = "PAPER"
+    is_live = runtime_mode == "LIVE"
+
+    qty_mode = (os.getenv("QTY_MODE") or "auto").lower()  # "auto" | "base" | "quote"
+
+    avail_usdt = None
+    if is_live and side.lower() == "buy" and hasattr(api, "get_account_list"):
+        try:
+            bals = api.get_account_list()
+            for b in bals:
+                if str(b.get("currency")).upper() == "USDT" and str(b.get("type", "")).lower() == "trade":
+                    avail_usdt = float(b.get("available", 0.0))
+                    break
+        except Exception:
+            avail_usdt = None
+
+    qpx_in = float(price)
+    qty_in = float(qty)
+    qty_is_quote = (qty_mode == "quote")
+
+    if qty_mode == "auto":
+        # Heuristik: wenn qty*price >> verfügbares USDT, ist qty sehr wahrscheinlich USDT-Notional
+        if avail_usdt is not None and qty_in * qpx_in > avail_usdt * 1.1:
+            qty_is_quote = True
+        # Zusätzlich: sehr große qty bei hohem Preis -> wahrscheinlich USDT-Notional
+        if not qty_is_quote and qpx_in > 1000 and qty_in > 5:
+            qty_is_quote = True
+
+    if side.lower() == "buy" and qty_is_quote:
+        base_qty = qty_in / qpx_in
+        log_info(f"↪️ Interpretiere qty als QUOTE (USDT): {qty_in} USDT → {base_qty} {symbol.split('-')[0]}")
+        qty_in = base_qty
+
+    # Cap durch verfügbares USDT (mit Sicherheitsmarge)
+    if is_live and side.lower() == "buy" and avail_usdt is not None:
+        safety_margin_cap = float(os.getenv("KUCOIN_BUY_SAFETY_MARGIN", "0.98"))
+        max_affordable_base = (avail_usdt * safety_margin_cap) / qpx_in
+        if qty_in > max_affordable_base:
+            log_info(f"💳 Menge gekappt durch verfügbare USDT: {qty_in} → {max_affordable_base}")
+            qty_in = max_affordable_base
+
+    # Optional: absolute Kappe per MAX_TRADE_USDT
+    try:
+        max_trade_usdt = float(os.getenv("MAX_TRADE_USDT", "0"))
+    except Exception:
+        max_trade_usdt = 0.0
+    if side.lower() == "buy" and max_trade_usdt > 0:
+        cap_base = max_trade_usdt / qpx_in
+        if qty_in > cap_base:
+            log_info(f"📉 Menge durch MAX_TRADE_USDT gekappt: {qty_in} → {cap_base}")
+            qty_in = cap_base
+
+    # 1) Precision + Constraints prüfen (nach Normalisierung)
+    qpx, qqty, err, notional = prepare_order(symbol, side, price, qty_in)
+    if err:
+        log_info(f"Local reject {symbol} {side}: {err} (px={qpx}, qty={qqty}, notional={notional})")
+        return {"status": "rejected_local", "reason": err, "symbol": symbol, "side": side, "price": str(qpx), "qty": str(qqty)}
+
+    # --- Safety margin to avoid 200004 (Balance insufficient) on LIVE BUYs ---
+    try:
+        runtime_mode = os.getenv("RUNTIME_MODE") or get_config("MODE") or "PAPER"
+    except Exception:
+        runtime_mode = "PAPER"
+    is_live = str(runtime_mode).upper() == "LIVE"
+    safety_margin = float(os.getenv("KUCOIN_BUY_SAFETY_MARGIN", "0.98"))
+    if is_live and str(side).lower() == "buy":
+        pre_qty = qqty
+        # reduce qty by margin
+        reduced_qty = float(qqty) * safety_margin
+        # re-apply rounding/constraints with the already rounded price `qpx`
+        qpx2, qqty2, err2, notional2 = prepare_order(symbol, side, qpx, reduced_qty)
+        if err2:
+            # If we drop below min notional because of the margin, keep original qty (will likely fail), but log it
+            log_info(f"⚠️ Safety margin made order invalid ({err2}); keeping original qty for {symbol} {side}")
+        else:
+            qqty = qqty2
+            log_info(f"🔧 Safety margin applied for LIVE BUY: qty {pre_qty} -> {qqty} (margin={safety_margin})")
+
+    # 2) Idempotenz-Key (prozessübergreifend stabil)
+    oid = make_client_oid(symbol, side, str(qpx), str(qqty), strategy=strategy)
+    odb = get_db()
+
+    # TTL-basiertes Aufräumen (verhindert hängende Reservierungen)
+    ttl_sec = int(os.getenv("IDEMPOTENCY_TTL_SEC", "5"))
+    try:
+        odb.purge_stale(ttl_sec=ttl_sec)
+    except Exception:
+        pass
+
+    # Duplicate-Check VOR der Reservierung
+    if odb.exists_active(oid, ttl_sec=ttl_sec):
+        try:
+            existing_state = (odb.get(oid) or {}).get("state")
+        except Exception:
+            existing_state = None
+        log_info(f"idempotent-skip {symbol} {side} oid={oid} state={existing_state}")
+        return {"status": "duplicate", "clientOid": oid}
+
+    # Reservierung: markiere diese OID als gesendet
+    odb.upsert_sent(oid, symbol, side, str(qpx), str(qqty))
+
+    # 3) Senden mit clientOid und State pflegen
+    try:
+        def _submit_limit():
+            # Try various wrappers/signatures
+            # 1) Wrapper method with snake_case client_oid
+            try:
+                if hasattr(api, "create_limit_order"):
+                    return api.create_limit_order(symbol, side, price=str(qpx), size=str(qqty), client_oid=oid)
+            except TypeError:
+                pass
+            # 2) Wrapper method with camelCase clientOid
+            try:
+                if hasattr(api, "create_limit_order"):
+                    return api.create_limit_order(symbol, side, price=str(qpx), size=str(qqty), clientOid=oid)
+            except TypeError:
+                pass
+            # 3) Generic place_order on wrapper
+            if hasattr(api, "place_order"):
+                return api.place_order(symbol=symbol, side=side, price=str(qpx), size=str(qqty), client_oid=oid, order_type="limit")
+            # 4) Direct access to underlying trade client if exposed
+            trade = getattr(api, "trade", None)
+            if trade and hasattr(trade, "create_limit_order"):
+                try:
+                    return trade.create_limit_order(symbol=symbol, side=side, price=str(qpx), size=str(qqty), clientOid=oid)
+                except TypeError:
+                    return trade.create_limit_order(symbol=symbol, side=side, price=str(qpx), size=str(qqty), client_oid=oid)
+            raise AttributeError("No compatible limit-order method found on KuCoin client")
+
+        def _submit_market():
+            # 1) Wrapper method
+            if hasattr(api, "create_market_order"):
+                try:
+                    return api.create_market_order(symbol, side, size=str(qqty))
+                except TypeError:
+                    return api.create_market_order(symbol=symbol, side=side, size=str(qqty))
+            # 2) Generic place_order on wrapper
+            if hasattr(api, "place_order"):
+                return api.place_order(symbol=symbol, side=side, size=str(qqty), order_type="market")
+            # 3) trade client
+            trade = getattr(api, "trade", None)
+            if trade and hasattr(trade, "create_market_order"):
+                return trade.create_market_order(symbol=symbol, side=side, size=str(qqty))
+            raise AttributeError("No compatible market-order method found on KuCoin client")
+
+        if order_type == "market":
+            resp = _submit_market()
+        else:
+            resp = _submit_limit()
+
+        new_state = "open"
+        if isinstance(resp, dict) and resp.get("status") in ("done", "filled", "success"):
+            new_state = "filled"
+
+        exch_id = None
+        if isinstance(resp, dict):
+            exch_id = resp.get("orderId") or resp.get("order_id") or resp.get("data") or resp.get("id")
+            resp["clientOid"] = oid
+            resp.setdefault("id", exch_id or oid)
+
+        odb.set_state(oid, new_state, exch_id)
+
+        # --- Enrich + persist order locally (history + positions) ---
+        try:
+            # Determine runtime/mode
+            try:
+                runtime_mode = (os.getenv("RUNTIME_MODE") or get_config("MODE") or "PAPER").upper()
+            except Exception:
+                runtime_mode = "PAPER"
+            is_live = runtime_mode == "LIVE"
+
+            # Prepare safe numeric values
+            qpx_final = float(qpx)
+            qqty_final = float(qqty)
+
+            # Try to fetch order details to obtain dealSize/dealFunds/fee
+            order_details = {}
+            trade_client = getattr(api, "trade", None)
+            if trade_client and exch_id:
+                for _i in range(3):
+                    try:
+                        od = trade_client.get_order_details(exch_id)
+                        if isinstance(od, dict):
+                            order_details = od
+                        deal_size_tmp = float((order_details.get("dealSize") or 0) or 0)
+                        status_tmp = str(order_details.get("status") or "").lower()
+                        if deal_size_tmp > 0 or status_tmp in ("done", "filled", "success", "finished"):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.35)
+
+            # Build order dict with fallbacks
+            now_ts = int(time.time())
+            order_side_up = str(side).upper()
+            # Default price:
+            eff_price = None
+            # 1) from order_details
+            try:
+                deal_size = float((order_details.get("dealSize") or 0) or 0)
+                deal_funds = float((order_details.get("dealFunds") or 0) or 0)
+                if deal_size > 0 and deal_funds > 0:
+                    eff_price = round(deal_funds / deal_size, 8)
+            except Exception:
+                pass
+            # 2) from input price (for limit) if still None
+            if eff_price is None and order_type == "limit":
+                eff_price = float(qpx_final)
+            # 3) from ticker (market fallback)
+            if eff_price is None:
+                try:
+                    market_client = getattr(api, "market", None)
+                    if market_client:
+                        tk = market_client.get_ticker(symbol)
+                        eff_price = float(tk.get("price"))
+                except Exception:
+                    eff_price = None
+
+            # Fee fallback
+            fee_val = None
+            try:
+                fee_raw = order_details.get("fee") if isinstance(order_details, dict) else None
+                if fee_raw is not None:
+                    fee_val = round(float(fee_raw), 8)
+            except Exception:
+                fee_val = None
+            if fee_val is None:
+                fee_val = 0.0
+
+            order_local = {
+                "id": resp.get("id") or exch_id or oid,
+                "timestamp": now_ts,
+                "mode": "LIVE" if is_live else "PAPER",
+                "symbol": symbol,
+                "side": order_side_up,
+                "quantity": qqty_final,
+                "price": eff_price,
+                "fee": fee_val,
+                "entry_price": eff_price if order_side_up == "BUY" else None,
+                "sl": None,
+                "tp": None,
+                "pnl": 0.0,
+                "reason": strategy or "default",
+                "trade_tags": {"sender": "send_order_prepared", "order_type": order_type},
+            }
+
+            # Compute basic SL/TP fallback (avoid None in history)
+            try:
+                if order_local["entry_price"]:
+                    ep = float(order_local["entry_price"])
+                    sl_off = 0.01
+                    tp_off = 0.03
+                    order_local["sl"] = round(ep * (1 - sl_off), 6)
+                    order_local["tp"] = round(ep * (1 + tp_off), 6)
+            except Exception:
+                pass
+
+            # Persist into order_history.json
+            record_order(order_local)
+
+            # --- Telegram notification for BUY/SELL (unified) ---
+            try:
+                from core.telegram_utils import send_telegram_message
+                # Prepare formatting values
+                price_val = order_local.get("price")
+                try:
+                    price_str = f"{float(price_val):.5f}" if price_val is not None else "?"
+                except Exception:
+                    price_str = str(price_val) if price_val is not None else "?"
+                qty_val = qqty_final
+                ts_val = order_local.get("timestamp", now_ts)
+                sl_val = order_local.get("sl")
+                tp_val = order_local.get("tp")
+                # message per side
+                if order_side_up == "BUY":
+                    send_telegram_message(
+                        f"🟢 LIVE-ORDER\n"
+                        f"➡️ BUY {symbol}\n"
+                        f"💰 Preis: {price_str}\n"
+                        f"📦 Menge: {qty_val:.6f}\n"
+                        f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_val))}\n"
+                        f"🛑 Stop Loss: {sl_val}\n"
+                        f"🎯 Take Profit: {tp_val}\n",
+                        to_channel=True,
+                        to_private=True
+                    )
+                elif order_side_up == "SELL":
+                    fee_val = order_local.get("fee")
+                    try:
+                        fee_str = f"{float(fee_val):.6f}" if fee_val is not None else "?"
+                    except Exception:
+                        fee_str = str(fee_val) if fee_val is not None else "?"
+                    send_telegram_message(
+                        f"🔴 LIVE-ORDER\n"
+                        f"➡️ SELL {symbol}\n"
+                        f"💰 Preis: {price_str}\n"
+                        f"📦 Menge: {qty_val:.6f}\n"
+                        f"💸 Gebühr: {fee_str}\n"
+                        f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_val))}\n"
+                        f"🛑 Stop Loss: {sl_val}\n"
+                        f"🎯 Take Profit: {tp_val}\n",
+                        to_channel=True,
+                        to_private=True
+                    )
+            except Exception as _te:
+                log_error(f"⚠️ Telegram-Benachrichtigung in send_order_prepared fehlgeschlagen: {_te}")
+
+            # Persist into live positions if LIVE + BUY
+            if is_live and order_side_up == "BUY":
+                try:
+                    # Open via PositionManager to keep internal state updated (single source of truth)
+                    from core.position import PositionManager
+                    pm = PositionManager(mode="LIVE")
+                    pm.open(symbol, qqty_final, order_local["price"] or qpx_final, fee=fee_val, entry_fee=fee_val)
+                except Exception:
+                    pass
+        except Exception:
+            # Never break the original return on persistence errors
+            pass
+
+        return resp
+
+    except Exception as e:
+        # 4) Fallback: prüfen, ob Order unter clientOid existiert
+        try:
+            getter = None
+            if hasattr(api, "get_order_by_client_oid"):
+                getter = api.get_order_by_client_oid
+            elif hasattr(getattr(api, "trade", None), "get_order_by_client_oid"):
+                getter = api.trade.get_order_by_client_oid
+            if getter is not None:
+                q = getter(oid)
+                if q:
+                    odb.set_state(oid, "open", q.get("orderId") or q.get("id"))
+                    q["clientOid"] = oid
+                    q.setdefault("id", q.get("orderId") or q.get("id") or oid)
+                    return q
+        except Exception:
+            pass
+        odb.set_state(oid, "failed", last_error=str(e))
+        raise e
 
 def load_order_history():
     if not os.path.exists(ORDER_HISTORY_FILE):
@@ -131,6 +493,24 @@ def save_order_history(data: list):
         log_error(traceback.format_exc())
 
 def record_order(order, position=None):
+    # --- Normalize response id for robustness ---
+    try:
+        if isinstance(order, dict):
+            resp_id = order.get("id") or order.get("orderId") or order.get("clientOid")
+            if not resp_id:
+                sym = order.get("symbol", "?")
+                side = order.get("side", "?")
+                resp_id = f"{sym}-{side}-{int(time.time()*1000)}"
+            order.setdefault("id", resp_id)
+    except Exception:
+        pass
+    # Skip duplicates from idempotent acknowledgements
+    try:
+        if isinstance(order, dict) and order.get("status") == "duplicate":
+            log_info(f"duplicate-not-saved id={order.get('id') or order.get('clientOid')}")
+            return
+    except Exception:
+        pass
     if DEBUG_MODE:
         log_info(f"Speichere Order in record_order: {order}")
     """
@@ -360,35 +740,47 @@ def place_market_order_live(pair, side, quantity=None, price=None, position_mana
         order_id = response["orderId"]
         order_details = {}
         if order_id:
-            try:
-                order_details = trade_client.get_order_details(order_id)
-            except Exception as e:
-                log_error(f"⚠️ Konnte Orderdetails nicht laden (BUY): {e}")
-                order_details = {}
+            # Retry a few times to allow KuCoin to populate deal fields
+            for _i in range(3):
+                try:
+                    od = trade_client.get_order_details(order_id)
+                    if isinstance(od, dict):
+                        order_details = od
+                    # Break if we have any fills or a known status
+                    deal_size_tmp = float((order_details.get("dealSize") or 0) or 0)
+                    status_tmp = str(order_details.get("status") or "").lower()
+                    if deal_size_tmp > 0 or status_tmp in ("done", "filled", "success", "finished"):
+                        break
+                except Exception as e:
+                    log_error(f"⚠️ Konnte Orderdetails nicht laden (BUY): {e}")
+                time.sleep(0.5)
         else:
             log_error("❌ Keine gültige Order-ID erhalten.")
             order_details = {}
 
+        # Build initial order dict with safe fallbacks
         order = {
             "id": order_id,
             "timestamp": int(time.time()),
             "mode": "LIVE",
             "symbol": pair,
             "side": side.upper(),
-            "quantity": quantity,
-            "price": None,
-            "fee": None
+            "quantity": float(quantity),
+            "price": float(price) if price is not None else None,
+            "fee": 0.0,
         }
 
-        # 📥 Versuche echte Orderdaten zu laden, um Fee und Preis ggf. zu aktualisieren
-        if order_details:
-            try:
-                fee = float(order_details.get("fee", 0))
-                deal_price = float(order_details.get("dealFunds", 0)) / float(order_details.get("dealSize", 1))
-                order["fee"] = round(fee, 6)
-                order["price"] = round(deal_price, 6)
-            except Exception as e:
-                log_error(f"⚠️ Fehler beim Verarbeiten der Orderdetails (BUY): {e}")
+        # Try to update with actual fee and deal price once available
+        try:
+            fee_raw = order_details.get("fee") if isinstance(order_details, dict) else None
+            if fee_raw is not None:
+                order["fee"] = round(float(fee_raw), 8)
+            deal_size = float((order_details.get("dealSize") or 0) or 0) if isinstance(order_details, dict) else 0.0
+            deal_funds = float((order_details.get("dealFunds") or 0) or 0) if isinstance(order_details, dict) else 0.0
+            if deal_size > 0 and deal_funds > 0:
+                order["price"] = round(deal_funds / deal_size, 8)
+        except Exception as e:
+            log_error(f"⚠️ Fehler beim Verarbeiten der Orderdetails (BUY): {e}")
 
         # Berechne SL/TP und PNL für den Trade
         try:
@@ -457,6 +849,8 @@ def place_market_order_live(pair, side, quantity=None, price=None, position_mana
                 try:
                     from core.telegram_utils import send_telegram_message
                     entry_price = order.get("price", None)
+                    if entry_price is None and price is not None:
+                        entry_price = float(price)
                     entry_str = f"{entry_price:.6f}" if entry_price is not None else "?"
                     price_str = f"{entry_price:.5f}" if entry_price is not None else "?"
                     fee_str = f"{order.get('fee', '?'):.6f}" if order.get('fee') is not None else "?"
@@ -595,6 +989,14 @@ def place_market_order_live(pair, side, quantity=None, price=None, position_mana
                     entry_str = f"{entry_price_val:.6f}" if entry_price_val not in [None, 0] else "nicht verfügbar"
                 except Exception:
                     entry_str = "nicht verfügbar"
+                # Ensure SL/TP are present in SELL notifications; fallback to min offsets if missing
+                if (sl_val in (None, 0) or tp_val in (None, 0)) and entry_price_val not in (None, 0):
+                    min_sl_offset = float(get_config("MIN_SL_OFFSET", 0.01))
+                    min_tp_offset = float(get_config("MIN_TP_OFFSET", 0.03))
+                    if sl_val in (None, 0):
+                        sl_val = round(entry_price_val * (1 - min_sl_offset), 6)
+                    if tp_val in (None, 0):
+                        tp_val = round(entry_price_val * (1 + min_tp_offset), 6)
                 # Format SL/TP as string with fallback
                 try:
                     sl_val_str = f"{sl_val:.6f}" if sl_val not in [None, 0] else "?"
@@ -661,6 +1063,13 @@ def place_market_order_live(pair, side, quantity=None, price=None, position_mana
             position = pm.get_open_position(pair)
         except Exception:
             position = None
+        # --- Ensure essential fields are present before persisting ---
+        order["symbol"] = order.get("symbol") or pair
+        order["side"] = (order.get("side") or side).upper()
+        if order.get("price") is None and price is not None:
+            order["price"] = float(price)
+        if order.get("quantity") is None:
+            order["quantity"] = float(quantity)
         # Ensure order dict retains entry_price, sl, tp, pnl, and trailing_sl before record_order
         order["entry_price"] = order.get("entry_price") or order.get("price")
         order["trailing_sl"] = order.get("trailing_sl")
@@ -770,7 +1179,9 @@ def place_order(symbol: str, side: str, quantity: float, price: float = None, mo
                     quantity=order.get("quantity", 0),
                     price=order.get("price", 0),
                     fee=fee,
-                    timestamp=timestamp
+                    timestamp=timestamp,
+                    sl=order.get("sl"),
+                    tp=order.get("tp")
                 )
     return order
 
@@ -780,7 +1191,7 @@ def log_order_history(order: dict):
     pass
 # Add merge_position_live at the end of the file
 
-def merge_position_live(symbol, quantity, price, fee, timestamp):
+def merge_position_live(symbol, quantity, price, fee, timestamp, sl=None, tp=None):
     import uuid
     from core.utils import load_json_file, save_json_file
     # LIVE_POSITIONS_FILE importiert aus config.config (muss ein Pfad/str sein)
@@ -814,6 +1225,11 @@ def merge_position_live(symbol, quantity, price, fee, timestamp):
         pos["entry_price"] = round(new_price, 8)
         pos["timestamp"] = timestamp
         pos["fee"] = round(pos.get("fee", 0.0) + fee, 8)
+        # Add/update SL/TP if provided
+        if sl is not None:
+            pos["sl"] = round(sl, 8)
+        if tp is not None:
+            pos["tp"] = round(tp, 8)
         positions[existing_position_key] = pos
     else:
         key = f"{symbol}__{timestamp}__{uuid.uuid4().hex[:6]}"
@@ -827,6 +1243,10 @@ def merge_position_live(symbol, quantity, price, fee, timestamp):
             "entry_fee": round(fee, 8),
             "timestamp": timestamp
         }
+        if sl is not None:
+            positions[key]["sl"] = round(sl, 8)
+        if tp is not None:
+            positions[key]["tp"] = round(tp, 8)
 
     # Korrigierter Aufruf: Dateipfad als erstes Argument, Daten als zweites
     save_json_file(str(LIVE_POSITIONS_FILE), positions)

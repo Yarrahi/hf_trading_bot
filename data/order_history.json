@@ -1,32 +1,20 @@
 [
     {
-        "id": "6895ebd980a96c000757d157",
-        "timestamp": 1754655705,
-        "mode": "LIVE",
-        "symbol": "DOGE-USDT",
+        "id": "6899b554100fac0007bbbb80",
+        "symbol": "ETH-USDT",
         "side": "BUY",
-        "quantity": 28.1847,
-        "price": 0.22212,
-        "fee": 0.00626,
-        "entry_price": 0.22212,
-        "sl": 0.220137,
-        "tp": 0.225425,
-        "pnl": 0.0,
-        "reason": null
+        "quantity": 0.0011466,
+        "price": 4273.48,
+        "timestamp": 1754903893,
+        "mode": "LIVE"
     },
     {
-        "id": "6895eef8c268f100070cf3c6",
-        "timestamp": 1754656504,
-        "mode": "LIVE",
-        "symbol": "DOGE-USDT",
+        "id": "6899b59a100fac0007bcef5d",
+        "symbol": "ETH-USDT",
         "side": "SELL",
-        "quantity": 28.1841,
-        "price": 0.22228,
-        "fee": 0.006265,
-        "entry_price": 0.22212,
-        "sl": 0.2224437,
-        "tp": 0.22263629999999998,
-        "pnl": 0.07,
-        "reason": "Manual/Signal Sell"
+        "quantity": 0.0011466,
+        "price": 4274.73308216,
+        "timestamp": 1754903962,
+        "mode": "LIVE"
     }
 ]

@@ -11,9 +11,10 @@ from core.logger import log
 from core.position import PositionManager
 from core.telegram_utils import notify_live_balance, send_telegram_message
 from core.kucoin_api import kucoin_client
-from core.order import record_order
+from core.order import record_order, send_order_prepared
 from core.wallet import get_dynamic_position_size, calculate_position_size
 from core.paper_wallet import PaperWallet
+from core.paper_order import PaperOrderHandler
 from strategies.atr import calculate_atr
 
 # ENV-Konfiguration
@@ -45,6 +46,8 @@ MAX_DRAWDOWN = float(os.getenv("MAX_DRAWDOWN", 20.0))
 BALANCE_FILE = "data/balance_tracker.json"
 mode = os.getenv("MODE", "PAPER")
 log.info(f"🧠 Realtime-Engine gestartet im {mode}-Modus")
+IS_PAPER = mode.upper() == "PAPER"
+PAPER_HANDLER = PaperOrderHandler() if IS_PAPER else None
 
 # State
 price_buffers = {}
@@ -256,33 +259,41 @@ def on_new_price(symbol: str, price: float, *_):
                 atr_sl_mult = ATR_MULTIPLIER_SL
             if atr_tp_mult is None or atr_tp_mult < 0.1:
                 atr_tp_mult = ATR_MULTIPLIER_TP
-            response = order_handler.place_order(symbol, "buy", trade_quantity, price)
-            if response:
-                entry_price = response.get("price", price)
-                sl_offset = float(os.getenv("TRAILING_SL_OFFSET", 0.005))
-                tp_offset = float(os.getenv("TRAILING_TP_OFFSET", 0.02))
-                try:
-                    kline_data = safe_get_candles(symbol, interval="15min", limit=50)
-                    atr_val = calculate_atr(kline_data)
-                    new_sl = entry_price - atr_val * atr_sl_mult if atr_val is not None and atr_sl_mult is not None else entry_price * (1 - sl_offset)
-                    new_tp = entry_price + atr_val * atr_tp_mult if atr_val is not None and atr_tp_mult is not None else entry_price * (1 + tp_offset)
-                    log.info(f"📏 ATR-Berechnung für {symbol}: ATR={atr_val}, SL-Mult={atr_sl_mult}, TP-Mult={atr_tp_mult}")
-                except Exception as e:
-                    log.error(f"❌ ATR-Berechnung fehlgeschlagen, fallback auf feste Offsets: {e}")
-                    new_sl = entry_price * (1 - sl_offset)
-                    new_tp = entry_price * (1 + tp_offset)
-                position_manager.update_sl(symbol, new_sl)
-                position_manager.update_tp(symbol, new_tp)
-                record_order(response)
-                if mode.upper() == "LIVE":
-                    notify_live_balance()
-                send_telegram_message(
-                    f"📥 BUY durch Preisimpuls!\n"
-                    f"Symbol: {symbol}\nPreis: {entry_price:.5f}\n"
-                    f"SL: {new_sl:.5f} | TP: {new_tp:.5f}",
-                    to_private=True,
-                    to_channel=True
-                )
+            if IS_PAPER and PAPER_HANDLER is not None:
+                response = PAPER_HANDLER.place_order(symbol, "buy", trade_quantity, price, entry_reason="impulse")
+            else:
+                response = send_order_prepared(kucoin_client, symbol, "buy", price, trade_quantity, strategy="impulse", order_type="limit")
+            if response and isinstance(response, dict):
+                status = str(response.get("status", "")).lower()
+                exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
+                # Nur wenn Order wirklich an die Börse gesendet/akzeptiert wurde
+                if status in {"sent", "ack", "filled", "open"} or exch_id:
+                    entry_price = float(response.get("price", price))
+                    sl_offset = float(os.getenv("TRAILING_SL_OFFSET", 0.005))
+                    tp_offset = float(os.getenv("TRAILING_TP_OFFSET", 0.02))
+                    try:
+                        kline_data = safe_get_candles(symbol, interval="15min", limit=50)
+                        atr_val = calculate_atr(kline_data)
+                        new_sl = entry_price - atr_val * atr_sl_mult if atr_val is not None and atr_sl_mult is not None else entry_price * (1 - sl_offset)
+                        new_tp = entry_price + atr_val * atr_tp_mult if atr_val is not None and atr_tp_mult is not None else entry_price * (1 + tp_offset)
+                        log.info(f"📏 ATR-Berechnung für {symbol}: ATR={atr_val}, SL-Mult={atr_sl_mult}, TP-Mult={atr_tp_mult}")
+                    except Exception as e:
+                        log.error(f"❌ ATR-Berechnung fehlgeschlagen, fallback auf feste Offsets: {e}")
+                        new_sl = entry_price * (1 - sl_offset)
+                        new_tp = entry_price * (1 + tp_offset)
+                    position_manager.update_sl(symbol, new_sl)
+                    position_manager.update_tp(symbol, new_tp)
+                    if mode.upper() == "LIVE":
+                        notify_live_balance()
+                        send_telegram_message(
+                            f"📥 BUY durch Preisimpuls!\n"
+                            f"Symbol: {symbol}\nPreis: {entry_price:.5f}\n"
+                            f"SL: {new_sl:.5f} | TP: {new_tp:.5f}",
+                            to_private=True,
+                            to_channel=True
+                        )
+                else:
+                    log.info(f"🧯 BUY-Signal verworfen oder dupliziert – status={status}, response={response}")
 
     # === Trailing Stop-Loss / Take-Profit ===
     if position_manager.has_open_position(symbol):
@@ -342,19 +353,27 @@ def on_new_price(symbol: str, price: float, *_):
 
         if sl and price <= sl:
             log.info(f"🛑 Stop-Loss ausgelöst bei {price:.5f} für {symbol}")
-            response = order_handler.place_order(symbol, "sell", quantity, price)
-            if response:
-                position_manager.close_position(symbol)
-                record_order(response)
-                if mode.upper() == "LIVE":
-                    notify_live_balance()
-                send_telegram_message(
-                    f"🔔 Auto-Exit ausgelöst!\n"
-                    f"Symbol: {symbol}\nPreis: {price:.5f}\n"
-                    f"Stop-Loss erreicht.\nPNL: Berechnung folgt.",
-                    to_private=True,
-                    to_channel=True
-                )
+            if IS_PAPER and PAPER_HANDLER is not None:
+                response = PAPER_HANDLER.place_order(symbol, "sell", quantity, price, entry_reason="stop_loss")
+            else:
+                response = send_order_prepared(kucoin_client, symbol, "sell", price, quantity, strategy="impulse", order_type="market")
+            if response and isinstance(response, dict):
+                status = str(response.get("status", "")).lower()
+                exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
+                if status in {"sent", "ack", "filled", "open"} or exch_id:
+                    if not IS_PAPER:
+                        position_manager.close_position(symbol)
+                    if mode.upper() == "LIVE":
+                        notify_live_balance()
+                        send_telegram_message(
+                            f"🔔 Auto-Exit ausgelöst!\n"
+                            f"Symbol: {symbol}\nPreis: {price:.5f}\n"
+                            f"Stop-Loss erreicht.\nPNL: Berechnung folgt.",
+                            to_private=True,
+                            to_channel=True
+                        )
+                else:
+                    log.info(f"🧯 SL-Exit nicht bestätigt – status={status}, response={response}")
 
         elif tp and price >= tp:
             log.info(f"🎯 Take-Profit erreicht bei {price:.5f} für {symbol}")
@@ -365,33 +384,48 @@ def on_new_price(symbol: str, price: float, *_):
             if scale_out_enabled and sell_percent > 0:
                 partial_qty = quantity * sell_percent
                 log.info(f"📉 Scale-Out aktiviert – Verkaufe {sell_percent:.0%} ({partial_qty:.4f}) von {symbol}")
-                scale_response = order_handler.place_order(symbol, "sell", partial_qty, price)
-                if scale_response:
-                    record_order(scale_response)
+                if IS_PAPER and PAPER_HANDLER is not None:
+                    scale_response = PAPER_HANDLER.place_order(symbol, "sell", partial_qty, price, entry_reason="scale_out")
+                else:
+                    scale_response = send_order_prepared(kucoin_client, symbol, "sell", price, partial_qty, strategy="impulse", order_type="market")
+                if scale_response and isinstance(scale_response, dict):
+                    st = str(scale_response.get("status", "")).lower()
+                    ex_id = scale_response.get("orderId") or scale_response.get("order_id") or scale_response.get("exch_order_id") or scale_response.get("kucoin_order_id")
+                    if st in {"sent", "ack", "filled", "open"} or ex_id:
+                        if mode.upper() == "LIVE":
+                            notify_live_balance()
+                            send_telegram_message(
+                                f"⚖️ Scale-Out Verkauf\nSymbol: {symbol}\nMenge: {partial_qty:.4f}\nPreis: {price:.5f}",
+                                to_private=True,
+                                to_channel=True
+                            )
+                        if not IS_PAPER:
+                            position_manager.reduce_position(symbol, partial_qty)
+                        return
+                    else:
+                        log.info(f"🧯 Scale-Out nicht bestätigt – status={st}, response={scale_response}")
+
+            if IS_PAPER and PAPER_HANDLER is not None:
+                response = PAPER_HANDLER.place_order(symbol, "sell", quantity, price, entry_reason="take_profit")
+            else:
+                response = send_order_prepared(kucoin_client, symbol, "sell", price, quantity, strategy="impulse", order_type="market")
+            if response and isinstance(response, dict):
+                status = str(response.get("status", "")).lower()
+                exch_id = response.get("orderId") or response.get("order_id") or response.get("exch_order_id") or response.get("kucoin_order_id")
+                if status in {"sent", "ack", "filled", "open"} or exch_id:
+                    if not IS_PAPER:
+                        position_manager.close_position(symbol)
                     if mode.upper() == "LIVE":
                         notify_live_balance()
-                    send_telegram_message(
-                        f"⚖️ Scale-Out Verkauf\nSymbol: {symbol}\nMenge: {partial_qty:.4f}\nPreis: {price:.5f}",
-                        to_private=True,
-                        to_channel=True
-                    )
-                    # Menge reduzieren
-                    position_manager.reduce_position(symbol, partial_qty)
-                    return  # Warten bis später für kompletten Exit
-
-            response = order_handler.place_order(symbol, "sell", quantity, price)
-            if response:
-                position_manager.close_position(symbol)
-                record_order(response)
-                if mode.upper() == "LIVE":
-                    notify_live_balance()
-                send_telegram_message(
-                    f"🎯 Take-Profit erreicht!\n"
-                    f"Symbol: {symbol}\nPreis: {price:.5f}\n"
-                    f"PNL: Berechnung folgt.",
-                    to_private=True,
-                    to_channel=True
-                )
+                        send_telegram_message(
+                            f"🎯 Take-Profit erreicht!\n"
+                            f"Symbol: {symbol}\nPreis: {price:.5f}\n"
+                            f"PNL: Berechnung folgt.",
+                            to_private=True,
+                            to_channel=True
+                        )
+                else:
+                    log.info(f"🧯 TP-Exit nicht bestätigt – status={status}, response={response}")
 
     # === Recovery: SL/TP nachladen falls fehlen oder zu weit entfernt ===
     if position_manager.has_open_position(symbol):

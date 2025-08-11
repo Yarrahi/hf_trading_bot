@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 load_dotenv()
 DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
+# Logger imports
+from core.logger import log_debug, log_info, log_warning, log_error
+
 class Position:
     def __init__(self, pair: str, quantity: float, entry_price: float, side: str = "buy", sl: Optional[float] = None, tp: Optional[float] = None):
         self.pair = pair
@@ -18,9 +21,6 @@ class Position:
 
 import json
 
-# Logger imports
-from core.logger import log_debug
-
 class PositionManager:
     def __init__(self, mode: str = "LIVE"):
         self.mode = str(mode).upper()
@@ -28,8 +28,8 @@ class PositionManager:
         paper_file = os.getenv("PAPER_POSITIONS_FILE", "data/positions_paper.json")
         self.file_path = live_file if self.mode == "LIVE" else paper_file
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        log_info(f"📄 PositionManager init | mode={self.mode} | file={self.file_path}")
         if DEBUG_MODE:
-            from core.logger import log_info
             if os.path.exists(self.file_path):
                 try:
                     with open(self.file_path, "r") as f:
@@ -46,23 +46,31 @@ class PositionManager:
                 data = json.load(f)
             return data
         except Exception as e:
-            from core.logger import log_error
             log_error(f"Fehler beim Laden von Positionen ({self.file_path}): {e}")
             return {}
 
     def _save(self, data: dict) -> None:
         try:
-            with open(self.file_path, "w") as f:
+            os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+            # Falls kein Verzeichnisanteil (""), ersetze mit aktuelles Verzeichnis
+            dirpart = os.path.dirname(self.file_path) or "."
+            os.makedirs(dirpart, exist_ok=True)
+            tmp_path = self.file_path + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(data, f, indent=4)
+            os.replace(tmp_path, self.file_path)
         except Exception as e:
-            from core.logger import log_error
             log_error(f"Fehler beim Speichern von Positionen ({self.file_path}): {e}")
+
+    def save_to_disk(self) -> None:
+        """Forciert das Schreiben der aktuellen Positionsdaten erneut auf die Platte."""
+        data = self.load_positions()
+        self._save(data)
 
     def close(self, pair: str) -> None:
         data = self.load_positions()
         # Neue Logik: Alle Positionen für das Symbol finden (Key beginnt mit SYMBOL__ oder symbol-Feld passt)
         keys_to_delete = [key for key, pos in data.items() if pos.get("symbol") == pair or key.startswith(f"{pair}__")]
-        from core.logger import log_info
         log_info(f"🗑️ Zu löschende Keys für {pair}: {keys_to_delete}")
         log_info(f"🗑️ Lösche Positionen für {pair}: {keys_to_delete}")
         for key in keys_to_delete:
@@ -76,15 +84,20 @@ class PositionManager:
 
     def exists(self, pair: str) -> bool:
         data = self.load_positions()
-        return pair in data and data[pair].get("entry_price") is not None
+        # Keys sind id-basiert: SYMBOL__ts__id  ODER pos['symbol'] == pair
+        for key, pos in data.items():
+            if key.startswith(f"{pair}__") or (isinstance(pos, dict) and pos.get("symbol") == pair):
+                return bool(pos.get("entry_price") is not None)
+        return False
 
     def get(self, pair: str) -> Union[dict, None]:
         data = self.load_positions()
-        pos = data.get(pair)
-        if not pos:
-            log_debug(f"⚠️ Keine Position für {pair} gefunden.")
-            return None
-        return pos
+        # Suche per Key-Prefix oder symbol-Feld
+        for key, pos in data.items():
+            if key.startswith(f"{pair}__") or (isinstance(pos, dict) and pos.get("symbol") == pair):
+                return pos
+        log_debug(f"⚠️ Keine Position für {pair} gefunden.")
+        return None
 
     def get_entry_price(self, pair: str) -> Optional[float]:
         pos = self.get(pair)
@@ -108,12 +121,15 @@ class PositionManager:
         return self.exists(pair)
 
     def set_sl_tp(self, pair: str, sl: float, tp: float) -> None:
-        """Speichert Stop-Loss (SL) und Take-Profit (TP) für eine offene Position."""
-        from core.logger import log_info, log_error
+        """Speichert Stop-Loss (SL) und Take-Profit (TP) für alle offenen Positionen eines Symbols."""
         data = self.load_positions()
-        if pair in data:
-            data[pair]["sl"] = sl
-            data[pair]["tp"] = tp
+        updated = False
+        for pos_id, pos in data.items():
+            if pos.get("symbol") == pair or pos_id.startswith(f"{pair}__"):
+                pos["sl"] = sl
+                pos["tp"] = tp
+                updated = True
+        if updated:
             self._save(data)
             if DEBUG_MODE:
                 log_info(f"💾 SL/TP für {pair} gesetzt: SL = {sl}, TP = {tp}")
@@ -133,10 +149,8 @@ class PositionManager:
     def save_position(self, position: dict) -> None:
         """Speichert eine offene Position dauerhaft und unterstützt mehrere Positionen pro Symbol."""
         if position.get("quantity", 0) <= 0:
-            from core.logger import log_warning
             log_warning(f"⚠️ Position mit ungültiger Menge ({position.get('quantity')}) wird nicht gespeichert: {position}")
             return
-        from core.logger import log_info, log_error
         path = self.file_path
         try:
             with open(self.file_path, 'r') as f:
@@ -160,7 +174,6 @@ class PositionManager:
         try:
             fee = float(position["fee"])
         except (KeyError, TypeError, ValueError):
-            from core.logger import log_warning
             log_warning(f"⚠️ Position hat ungültige Fee: {position.get('fee')}, setze auf 0.0")
             fee = 0.0
         position["fee"] = fee
@@ -170,23 +183,34 @@ class PositionManager:
         if self.mode == "LIVE":
             existing_key = None
             for key in data:
-                if symbol in key:
+                if key.startswith(f"{symbol}__"):
                     existing_key = key
                     break
             if existing_key:
                 if DEBUG_MODE:
-                    from core.logger import log_info
                     log_info(f"🔄 Aktualisiere bestehende LIVE-Position für {symbol}")
                 existing_position = data[existing_key]
                 # Position zusammenführen: neue Menge addieren, gewichteter Durchschnittspreis berechnen
-                total_quantity = existing_position["quantity"] + position["quantity"]
+                try:
+                    existing_qty = float(existing_position.get("quantity", 0.0))
+                except (TypeError, ValueError):
+                    existing_qty = 0.0
+                try:
+                    incoming_qty = float(position.get("quantity", 0.0))
+                except (TypeError, ValueError):
+                    incoming_qty = 0.0
+                if incoming_qty <= 0:
+                    log_warning(f"⚠️ Eingehende Menge ≤ 0 – Position nicht gemerged: {position}")
+                    incoming_qty = 0.0
+                total_quantity = existing_qty + incoming_qty
+
                 if total_quantity > 0:
                     weighted_price = (
-                        existing_position["entry_price"] * existing_position["quantity"]
-                        + position["entry_price"] * position["quantity"]
+                        float(existing_position.get("entry_price", position["entry_price"])) * existing_qty
+                        + float(position["entry_price"]) * incoming_qty
                     ) / total_quantity
                 else:
-                    weighted_price = position["entry_price"]
+                    weighted_price = float(position["entry_price"])
 
                 existing_position["quantity"] = total_quantity
                 existing_position["entry_price"] = weighted_price
@@ -198,7 +222,6 @@ class PositionManager:
                 self._save(data)
             else:
                 if "fee" not in position:
-                    from core.logger import log_warning
                     log_warning(f"⚠️ Position wurde ohne Fee gespeichert: {symbol}")
                 random_id = uuid.uuid4().hex[:6]
                 position_id = f"{symbol}__{timestamp}__{random_id}"
@@ -210,7 +233,6 @@ class PositionManager:
             data[position_id] = position
             self._save(data)
 
-        from core.logger import log_info
         log_info(f"💾 Position gespeichert unter ID {position_id} für {symbol} ({self.mode})")
         log_info(f"💾 Gespeicherte Positionsdaten: {json.dumps(data[position_id], indent=2)}")
 
@@ -219,7 +241,6 @@ class PositionManager:
         Prüft, ob es eine offene Position für das angegebene Symbol gibt und loggt Details.
         """
         data = self.load_positions()
-        from core.logger import log_info
         open_positions = [pos_id for pos_id, pos in data.items() if pos.get("symbol") == symbol or pos_id.startswith(f"{symbol}__")]
         if DEBUG_MODE:
             log_info(f"🔍 has_open_position-Check für {symbol}: Gefundene offene Positionen: {open_positions}")
@@ -235,10 +256,10 @@ class PositionManager:
 
     def open(self, pair: str, quantity: float, entry_price: float, side: str = "buy", fee: Optional[float] = None, entry_fee: Optional[float] = None) -> None:
         """Öffnet eine neue Position und speichert sie."""
-        from core.logger import log_info
         if DEBUG_MODE:
             log_info(f"📥 Öffne Position: Pair={pair}, Menge={quantity}, Entry={entry_price}, Side={side}, Fee={fee}, EntryFee={entry_fee}")
             log_info(f"✅ Übergabe an save_position: fee={fee}, entry_fee={entry_fee}")
+        log_info(f"📦 Position wird in Datei gespeichert: {self.file_path}")
         final_fee = float(fee) if fee is not None else float(entry_fee) if entry_fee is not None else 0.0
         self.save_position({
             "pair": pair,
@@ -277,7 +298,6 @@ class PositionManager:
                 updated = True
         if updated:
             self._save(positions)
-            from core.logger import log_info
             log_info(f"🔄 SL für {symbol} aktualisiert auf {new_sl}")
         return updated
 
@@ -293,7 +313,6 @@ class PositionManager:
                 updated = True
         if updated:
             self._save(positions)
-            from core.logger import log_info
             log_info(f"🔄 TP für {symbol} aktualisiert auf {new_tp}")
         return updated
     def get_open_positions(self) -> list:

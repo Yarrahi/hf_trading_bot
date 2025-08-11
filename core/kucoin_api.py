@@ -18,6 +18,8 @@ import time
 from core.logger_setup import setup_logger
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from decimal import Decimal
+from core.filters import filter_book, SymbolFilters
 logger = setup_logger(__name__)
 
 # Runtime Mode Resolution
@@ -30,15 +32,18 @@ def safe_api_call(func, *args, retries=3, delay=1, timeout=3, **kwargs):
     Führt einen API-Aufruf mit automatischen Wiederholungsversuchen (Exponential Backoff).
     Timeout und besseres Logging inkludiert.
     """
+    last_exc = None
     for attempt in range(retries):
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(func, *args, **kwargs)
                 return future.result(timeout=timeout)
         except TimeoutError as te:
+            last_exc = te
             logger.warning(f"API-Timeout bei {func.__name__}: {te} (Versuch {attempt+1}/{retries})")
             time.sleep(delay * (2 ** attempt))
         except Exception as e:
+            last_exc = e
             logger.warning(f"API-Fehler bei {func.__name__}: {e} (Versuch {attempt+1}/{retries})")
             time.sleep(delay * (2 ** attempt))
     from core.telegram_utils import send_telegram_message
@@ -48,7 +53,10 @@ def safe_api_call(func, *args, retries=3, delay=1, timeout=3, **kwargs):
         send_telegram_message(f"⚠️ {error_msg}", to_private=True, to_channel=False)
     except Exception as te:
         logger.warning(f"Telegram-Benachrichtigung fehlgeschlagen: {te}")
-    raise
+    # Raise the last captured exception, or a generic error if none captured
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(error_msg)
 
 class KuCoinClientWrapper:
     def __init__(self):
@@ -172,7 +180,33 @@ class KuCoinClientWrapper:
         if RUNTIME_MODE != "LIVE":
             logger.info(f"ℹ️ PAPER-Mode: create_market_order({symbol}, {side}, size={size}, funds={funds}) übersprungen – kein Live-Call.")
             return {"orderId": "paper-skip", "symbol": symbol, "side": side, "size": size, "funds": funds}
-        return self.trade.create_market_order(symbol=symbol, side=side, size=size, funds=funds)
+        return safe_api_call(self.trade.create_market_order, symbol=symbol, side=side, size=size, funds=funds)
+
+    def create_limit_order(self, symbol, side, price, size, client_oid: str = None,
+                           time_in_force: str = "GTC", post_only: bool = False,
+                           hidden: bool = False, iceberg: bool = False, remark: str = None,
+                           cancel_after: int = None):
+        """Compat helper to place a KuCoin limit order. Routes to SDK via safe_api_call.
+        Keyword names follow KuCoin's REST fields (clientOid, timeInForce, postOnly...).
+        """
+        if RUNTIME_MODE != "LIVE":
+            logger.info(f"ℹ️ PAPER-Mode: create_limit_order({symbol}, {side}, price={price}, size={size}) übersprungen – kein Live-Call.")
+            return {"orderId": "paper-skip", "symbol": symbol, "side": side, "price": price, "size": size, "clientOid": client_oid}
+        # Ensure strings for price/size to avoid Decimal serialization quirks
+        return safe_api_call(
+            self.trade.create_limit_order,
+            symbol=symbol,
+            side=side,
+            price=str(price),
+            size=str(size),
+            clientOid=client_oid,
+            timeInForce=time_in_force,
+            postOnly=post_only,
+            hidden=hidden,
+            iceberg=iceberg,
+            remark=remark,
+            cancelAfter=cancel_after,
+        )
 
     @lru_cache(maxsize=128)
     def get_symbol_min_order_size(self, symbol: str):
@@ -229,6 +263,23 @@ class KuCoinClientWrapper:
         except Exception as e:
             logger.info(f"⚠️ Fehler beim Abrufen der offenen Orders für {symbol}: {e}")
             return []
+
+
+    def get_symbols(self):
+        """
+        Gibt die Liste der Symbole aus der KuCoin Market API zurück (äquivalent zu /api/v2/symbols).
+        """
+        try:
+            return safe_api_call(self.market.get_symbol_list)
+        except Exception:
+            return []
+
+    def get_order_by_client_oid(self, client_oid: str):
+        """Wrapper auf KuCoin get_order_by_client_oid(clientOid=...)."""
+        try:
+            return safe_api_call(self.trade.get_order_by_client_oid, clientOid=client_oid)
+        except Exception:
+            return None
 
 
     @lru_cache(maxsize=128)
@@ -332,6 +383,43 @@ class KuCoinClientWrapper:
         except Exception as e:
             logger.info(f"⚠️ Fehler beim Abrufen der Account-Balances: {e}")
             return {}
+
+
+# --- Filters-Helper für Phase 1 ---
+
+def _kucoin_symbol_to_filters(symbol_info: dict) -> SymbolFilters:
+    # KuCoin liefert priceIncrement/baseIncrement und bei Spot minFunds
+    price_inc = Decimal(str(symbol_info.get("priceIncrement") or symbol_info.get("tickSize") or "0.00000001"))
+    base_inc  = Decimal(str(symbol_info.get("baseIncrement") or symbol_info.get("lotSize") or "0.00000001"))
+    min_funds = symbol_info.get("minFunds")
+    try:
+        min_funds = Decimal(str(min_funds)) if min_funds is not None else None
+    except Exception:
+        min_funds = None
+    return SymbolFilters(price_increment=price_inc, base_increment=base_inc, min_funds=min_funds)
+
+
+def refresh_symbol_filters(api_client=None) -> None:
+    """
+    Lädt die KuCoin-Symbolliste und füllt den globalen FilterBook-Cache.
+    Wenn `api_client` nicht angegeben ist, wird temporär ein KuCoinClientWrapper instanziiert.
+    """
+    client = api_client or KuCoinClientWrapper()
+    try:
+        data = client.get_symbols()
+        mapping = {}
+        for s in data or []:
+            sym = (s.get("symbol") or s.get("symbolName") or s.get("name") or "").upper()
+            if not sym:
+                continue
+            mapping[sym] = _kucoin_symbol_to_filters(s)
+        if mapping:
+            filter_book.set_all(mapping)
+            logger.info(f"Loaded {len(mapping)} KuCoin symbol filters into FilterBook")
+        else:
+            logger.warning("No KuCoin symbols returned; FilterBook not updated.")
+    except Exception as e:
+        logger.warning(f"Could not refresh KuCoin symbol filters: {e}")
 
 kucoin_client = KuCoinClientWrapper()
 

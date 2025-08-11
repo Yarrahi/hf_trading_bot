@@ -1,13 +1,13 @@
 {
     "USDT": {
-        "available": 119.03267239,
+        "available": 120.44693714,
         "hold": 0.0,
-        "balance": 119.03267239
+        "balance": 120.44693714
     },
-    "DOGE": {
-        "available": 28.2658,
+    "ETH": {
+        "available": 0.001145,
         "hold": 0.0,
-        "balance": 28.2658
+        "balance": 0.001145
     },
     "LTC": {
         "available": 0.01,
@@ -39,10 +39,10 @@
         "hold": 0.0,
         "balance": 0.18
     },
-    "ETH": {
-        "available": 2.9e-06,
+    "DOGE": {
+        "available": 0.0817,
         "hold": 0.0,
-        "balance": 2.9e-06
+        "balance": 0.0817
     },
     "BTC": {
         "available": 0.0,

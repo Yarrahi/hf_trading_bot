@@ -6,7 +6,31 @@
         "trailing_offset": 0.005,
         "scale_out": {
             "active": false,
-            "sell_percent": 100
+            "sell_percent": 1.0
+        }
+    },
+    "BTC-USDT": {
+        "tp": 0.003,
+        "sl": 0.002,
+        "atr_sl_mult": 0.10,
+        "atr_tp_mult": 0.10,
+        "use_trailing": false,
+        "trailing_offset": 0.005,
+        "scale_out": {
+            "active": true,
+            "sell_percent": 0.5
+        }
+    },
+    "ETH-USDT": {
+        "tp": 0.003,
+        "sl": 0.002,
+        "atr_sl_mult": 0.10,
+        "atr_tp_mult": 0.10,
+        "use_trailing": false,
+        "trailing_offset": 0.005,
+        "scale_out": {
+            "active": true,
+            "sell_percent": 0.5
         }
     }
 }

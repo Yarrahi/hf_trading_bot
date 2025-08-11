@@ -2,18 +2,22 @@
 # Simuliertes Wallet für Paper-Trading-Modus
 
 from core.logger import log_info
+import os
+import json
 from config.config import get_pair_list
 
 class PaperWallet:
     def __init__(self):
-        # Initiales fiktives Guthaben, ENV-abhängig anpassbar
-        import os
-        start_usdt = float(os.getenv("PAPER_START_BALANCE_USDT", "10000"))
-        if start_usdt <= 0:
-            start_usdt = 10000
-            log_info(f"⚠️ PAPER_START_BALANCE_USDT war ungültig oder 0 – Standardwert {start_usdt} USDT gesetzt.")
-        self.balances = {
-            "USDT": start_usdt,
+        # Konfiguration aus ENV
+        start_usdt = float(os.getenv("PAPER_START_BALANCE_USDT", "10000") or 10000)
+        reset_on_start = os.getenv("PAPER_RESET_ON_START", "false").lower() == "true"
+        top_up = float(os.getenv("PAPER_TOP_UP_USDT", "0") or 0)
+        self.wallet_file = os.getenv("PAPER_WALLET_FILE")  # optional: persistente Datei
+        self._persist_enabled = bool(self.wallet_file)
+
+        # Standard-Balances
+        default_balances = {
+            "USDT": start_usdt if start_usdt > 0 else 10000.0,
             "BTC": 0.0,
             "ETH": 0.0,
             "ADA": 0.0,
@@ -21,9 +25,66 @@ class PaperWallet:
             "SOL": 0.0,
         }
 
+        # Laden aus Datei, wenn vorhanden und kein Reset angefordert
+        loaded = False
+        if self._persist_enabled and not reset_on_start:
+            loaded = self._load_persisted()
+
+        # Falls nicht geladen oder Reset verlangt, mit Defaults initialisieren
+        if not loaded:
+            if start_usdt <= 0:
+                log_info(f"⚠️ PAPER_START_BALANCE_USDT war ungültig oder 0 – Standardwert 10000 USDT gesetzt.")
+            self.balances = dict(default_balances)
+
+        # Optionales Top-Up
+        if top_up > 0:
+            self.balances["USDT"] = float(self.balances.get("USDT", 0.0) + top_up)
+            log_info(f"💸 PAPER: Top-up von {top_up} USDT angewendet. Neuer USDT-Saldo: {self.balances['USDT']}")
+
+        # Persistenz: initialen Zustand speichern
+        if self._persist_enabled:
+            self._save_persisted()
+
+    def _save_persisted(self) -> None:
+        """Speichert Balances atomar in die konfigurierte Datei, falls aktiviert."""
+        if not self._persist_enabled or not self.wallet_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.wallet_file), exist_ok=True)
+            tmp_path = self.wallet_file + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(self.balances, f, indent=2)
+            os.replace(tmp_path, self.wallet_file)
+        except Exception as e:
+            log_info(f"⚠️ PAPER: Konnte Wallet nicht speichern ({self.wallet_file}): {e}")
+
+    def _load_persisted(self) -> bool:
+        """Lädt Balances aus Datei. Gibt True zurück, wenn erfolgreich geladen."""
+        try:
+            if not self.wallet_file or not os.path.exists(self.wallet_file):
+                return False
+            with open(self.wallet_file, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # nur bekannte Keys übernehmen, Rest ignorieren
+                self.balances = {
+                    "USDT": float(data.get("USDT", 0.0)),
+                    "BTC": float(data.get("BTC", 0.0)),
+                    "ETH": float(data.get("ETH", 0.0)),
+                    "ADA": float(data.get("ADA", 0.0)),
+                    "DOGE": float(data.get("DOGE", 0.0)),
+                    "SOL": float(data.get("SOL", 0.0)),
+                }
+                log_info(f"💾 PAPER: Wallet aus Datei geladen: {self.wallet_file}")
+                return True
+            return False
+        except Exception as e:
+            log_info(f"⚠️ PAPER: Konnte Wallet nicht laden ({self.wallet_file}): {e}")
+            return False
+
     def get_balance(self, symbol="USDT"):
         value = self.balances.get(symbol, 0.0)
-        log_info(f"💰 PAPER-Balance für {symbol}: {value}")
+        log_info(f"💰 PAPER Wallet: {symbol}={value}")
         return value
 
     def load_balance(self):
@@ -77,6 +138,9 @@ class PaperWallet:
             self.balances[quote] = quote_bal - total
             self.balances[base] = base_bal + quantity
             log_info(f"📥 PAPER: Gekauft {quantity:.8f} {base} @ {price:.8f} → Kosten {cost:.8f} {quote}, Fee {fee:.8f}")
+            if self._persist_enabled:
+                self._save_persisted()
+            return True
         else:
             sell_qty = min(quantity, base_bal)
             if sell_qty <= 0:
@@ -87,4 +151,6 @@ class PaperWallet:
             self.balances[base] = base_bal - sell_qty
             self.balances[quote] = quote_bal + (proceeds - fee)
             log_info(f"📤 PAPER: Verkauft {sell_qty:.8f} {base} @ {price:.8f} → Erlös {(proceeds - fee):.8f} {quote}, Fee {fee:.8f}")
-        return True
+            if self._persist_enabled:
+                self._save_persisted()
+            return True
