@@ -72,10 +72,9 @@ class OrderHandler:
         self.mode = mode
 
     def place_order(self, symbol, side, quantity, price=None, entry_reason=None, position_manager=None):
-        # Fallback: use handler's stored position_manager if caller didn't provide one
+        # Delegates to place_market_order_live(), which calls send_order_prepared() internally
         if position_manager is None:
             position_manager = getattr(self, "position_manager", None)
-        # Ensure entry_reason and position_manager are passed through
         return place_market_order_live(
             symbol,
             side,
@@ -347,6 +346,16 @@ def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str =
                 "reason": strategy or "default",
                 "trade_tags": {"sender": "send_order_prepared", "order_type": order_type},
             }
+            # Ensure BUY has non-None SL/TP defaults to avoid 'None' in Telegram/history
+            if order_side_up == "BUY" and order_local.get("entry_price"):
+                try:
+                    ep_tmp = float(order_local["entry_price"])
+                    min_sl_offset = float(get_config("MIN_SL_OFFSET", 0.01))
+                    min_tp_offset = float(get_config("MIN_TP_OFFSET", 0.03))
+                    order_local["sl"] = round(ep_tmp * (1 - min_sl_offset), 6)
+                    order_local["tp"] = round(ep_tmp * (1 + min_tp_offset), 6)
+                except Exception:
+                    pass
 
             # Compute basic SL/TP fallback (avoid None in history)
             try:
@@ -359,8 +368,51 @@ def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str =
             except Exception:
                 pass
 
-            # Persist into order_history.json
-            record_order(order_local)
+            # --- BUY fee backfill & avg fill price from fills (if fee still 0.0) ---
+            try:
+                if order_side_up == "BUY" and float(order_local.get("fee") or 0.0) == 0.0 and exch_id:
+                    trade_client = getattr(api, "trade", None)
+                    if trade_client and hasattr(trade_client, "get_fills"):
+                        fills_resp = None
+                        try:
+                            fills_resp = trade_client.get_fills(orderId=exch_id)
+                        except TypeError:
+                            try:
+                                fills_resp = trade_client.get_fills(order_id=exch_id)
+                            except Exception:
+                                fills_resp = None
+                        fills_list = []
+                        if isinstance(fills_resp, dict):
+                            if isinstance(fills_resp.get("items"), list):
+                                fills_list = fills_resp["items"]
+                            elif isinstance(fills_resp.get("data"), list):
+                                fills_list = fills_resp["data"]
+                        elif isinstance(fills_resp, list):
+                            fills_list = fills_resp
+                        total_fee_sum = 0.0
+                        total_fill_size = 0.0
+                        total_fill_funds = 0.0
+                        for fill in fills_list:
+                            try:
+                                total_fee_sum += float(fill.get("fee") or 0.0)
+                                sz = float(fill.get("size") or fill.get("dealSize") or 0.0)
+                                funds = float(fill.get("funds") or fill.get("dealFunds") or 0.0)
+                                if sz > 0:
+                                    total_fill_size += sz
+                                if funds > 0:
+                                    total_fill_funds += funds
+                            except Exception:
+                                continue
+                        if total_fee_sum > 0:
+                            order_local["fee"] = round(total_fee_sum, 8)
+                        if total_fill_size > 0 and total_fill_funds > 0:
+                            avg_px = round(total_fill_funds / total_fill_size, 8)
+                            order_local["price"] = avg_px
+                            if order_local.get("entry_price"):
+                                order_local["entry_price"] = avg_px
+            except Exception as _bf:
+                log_error(f"⚠️ BUY Fee-Backfill fehlgeschlagen: {_bf}")
+
 
             # --- Telegram notification for BUY/SELL (unified) ---
             try:
@@ -389,11 +441,72 @@ def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str =
                         to_private=True
                     )
                 elif order_side_up == "SELL":
+                    # --- Enrich SELL with entry/sl/tp from current LIVE position for proper Telegram + history ---
+                    entry_price_val = None
+                    sl_enriched = None
+                    tp_enriched = None
+                    p = None
+                    try:
+                        from core.position import PositionManager
+                        pm_tmp = PositionManager(mode="LIVE")
+                        data_tmp = pm_tmp.load_positions()
+                        for pid, p_ in data_tmp.items():
+                            if p_.get("symbol") == symbol or str(pid).startswith(f"{symbol}__"):
+                                entry_price_val = p_.get("entry_price", None)
+                                sl_enriched = p_.get("sl", None)
+                                tp_enriched = p_.get("tp", None)
+                                p = p_
+                                break
+                    except Exception:
+                        pass
+                    # Fallbacks if still None and we have a BUY price earlier in the session
+                    if order_local.get("entry_price") in (None, 0):
+                        order_local["entry_price"] = entry_price_val
+                    if order_local.get("sl") in (None, 0):
+                        order_local["sl"] = sl_enriched
+                    if order_local.get("tp") in (None, 0):
+                        order_local["tp"] = tp_enriched
+                    # Build display helpers
+                    try:
+                        entry_str = f"{float(order_local.get('entry_price')):.6f}" if order_local.get("entry_price") not in (None, 0) else "nicht verfügbar"
+                    except Exception:
+                        entry_str = "nicht verfügbar"
+                    try:
+                        sl_val_str = f"{float(order_local.get('sl')):.6f}" if order_local.get("sl") not in (None, 0) else "-"
+                    except Exception:
+                        sl_val_str = "-"
+                    try:
+                        tp_val_str = f"{float(order_local.get('tp')):.6f}" if order_local.get("tp") not in (None, 0) else "-"
+                    except Exception:
+                        tp_val_str = "-"
                     fee_val = order_local.get("fee")
                     try:
                         fee_str = f"{float(fee_val):.6f}" if fee_val is not None else "?"
                     except Exception:
                         fee_str = str(fee_val) if fee_val is not None else "?"
+                    # Compute PnL (percent and USDT) for Telegram & history
+                    pnl_pct_str = "n/a"
+                    pnl_usdt_str = ""
+                    try:
+                        exec_price = float(order_local.get("price") or 0)
+                        entry_px = float(order_local.get("entry_price") or 0)
+                        sell_fee = float(order_local.get("fee") or 0)
+                        # Try to read entry_fee from positions
+                        entry_fee_val = 0.0
+                        try:
+                            entry_fee_val = float(p.get("entry_fee") or p.get("fee") or 0.0) if p else 0.0
+                        except Exception:
+                            entry_fee_val = 0.0
+                        if exec_price > 0 and entry_px > 0 and qty_val is not None:
+                            pnl_abs = (exec_price - entry_px) * float(qty_val) - (sell_fee + entry_fee_val)
+                            pnl_pct = ((exec_price - entry_px) / entry_px) * 100.0
+                            order_local["pnl"] = round(pnl_pct, 4)
+                            order_local["pnl_usdt"] = round(pnl_abs, 6)
+                            sign = "+" if pnl_abs >= 0 else ""
+                            pnl_pct_str = f"{pnl_pct:.2f}%"
+                            pnl_usdt_str = f" ({sign}{pnl_abs:.6f} USDT)"
+                    except Exception:
+                        pass
                     send_telegram_message(
                         f"🔴 LIVE-ORDER\n"
                         f"➡️ SELL {symbol}\n"
@@ -401,11 +514,15 @@ def send_order_prepared(api, symbol: str, side: str, price, qty, strategy: str =
                         f"📦 Menge: {qty_val:.6f}\n"
                         f"💸 Gebühr: {fee_str}\n"
                         f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_val))}\n"
-                        f"🛑 Stop Loss: {sl_val}\n"
-                        f"🎯 Take Profit: {tp_val}\n",
+                        f"🎯 Entry: {entry_str}\n"
+                        f"📈 P&L: {pnl_pct_str}{pnl_usdt_str}\n"
+                        f"🛑 Stop Loss: {sl_val_str}\n"
+                        f"🎯 Take Profit: {tp_val_str}\n",
                         to_channel=True,
                         to_private=True
                     )
+                # Persist AFTER Telegram prep so SELL has entry/sl/tp filled
+                record_order(order_local)
             except Exception as _te:
                 log_error(f"⚠️ Telegram-Benachrichtigung in send_order_prepared fehlgeschlagen: {_te}")
 
@@ -511,6 +628,24 @@ def record_order(order, position=None):
             return
     except Exception:
         pass
+    # --- Backfill for SELL: ensure entry_price/sl/tp present ---
+    try:
+        if isinstance(order, dict) and str(order.get("side", "")).upper() == "SELL":
+            if not order.get("entry_price") or order.get("sl") is None or order.get("tp") is None:
+                from core.position import PositionManager
+                pm_bf = PositionManager(mode="LIVE")
+                data_bf = pm_bf.load_positions()
+                sym_bf = order.get("symbol")
+                for pid_bf, p_bf in data_bf.items():
+                    if p_bf.get("symbol") == sym_bf or str(pid_bf).startswith(f"{sym_bf}__"):
+                        order.setdefault("entry_price", p_bf.get("entry_price"))
+                        if order.get("sl") is None:
+                            order["sl"] = p_bf.get("sl")
+                        if order.get("tp") is None:
+                            order["tp"] = p_bf.get("tp")
+                        break
+    except Exception:
+        pass
     if DEBUG_MODE:
         log_info(f"Speichere Order in record_order: {order}")
     """
@@ -536,7 +671,7 @@ def record_order(order, position=None):
         }
 
         # --- PNL Berechnung für SELL Orders ---
-        if trade["side"] == "SELL":
+        if trade["side"] == "SELL" and (trade.get("pnl") is None or trade.get("pnl_usdt") is None):
             try:
                 entry_price = 0
                 if position:
@@ -554,7 +689,8 @@ def record_order(order, position=None):
                     abs_pnl = (exit_price - entry_price) * trade.get("quantity", 0)
                     pct_pnl = ((exit_price - entry_price) / entry_price) * 100
                     trade["pnl"] = round(pct_pnl, 2)
-                    trade["pnl_usdt"] = round(abs_pnl, 4)
+                    if trade.get("pnl_usdt") is None:
+                        trade["pnl_usdt"] = round(abs_pnl, 4)
             except Exception as e:
                 from core.logger import log_error
                 log_error(f"❌ Fehler bei PNL-Berechnung in record_order: {e}")
@@ -582,16 +718,20 @@ def log_trade_to_json(trade_data):
         side_val = str(side_val).upper()
     trade = {
         "id": trade_id,
+        "timestamp": trade_data.get("timestamp"),
+        "mode": trade_data.get("mode"),
         "symbol": trade_data.get("symbol"),
         "side": side_val,
         "quantity": trade_data.get("quantity"),
         "price": trade_data.get("price"),
-        "timestamp": trade_data.get("timestamp"),
-        "mode": trade_data.get("mode"),
+        "fee": trade_data.get("fee"),
+        "entry_price": trade_data.get("entry_price"),
+        "sl": trade_data.get("sl"),
+        "tp": trade_data.get("tp"),
+        "pnl": trade_data.get("pnl"),
+        "pnl_usdt": trade_data.get("pnl_usdt"),
+        "reason": trade_data.get("reason"),
     }
-    # Optionally include entry_reason if present
-    if "entry_reason" in trade_data:
-        trade["entry_reason"] = trade_data["entry_reason"]
     # Load current order history
     order_history = load_json_file("data/order_history.json")
     existing_ids = {t["id"] for t in order_history if isinstance(t, dict) and "id" in t}
@@ -604,500 +744,33 @@ def log_trade_to_json(trade_data):
     log_info(f"💾 Trade gespeichert (keine Duplikate): {trade['id']}")
 
 def place_market_order_live(pair, side, quantity=None, price=None, position_manager=None, entry_reason: str = None):
+    """
+    Thin wrapper to route ALL LIVE orders through send_order_prepared() to avoid duplicate logic.
+    - Ensures price is available (ticker fallback)
+    - Calls unified sender with order_type='market'
+    - Returns the API/response dict from send_order_prepared
+    """
     try:
-        from config.config import get_config
         from core.kucoin_api import KuCoinClientWrapper
         client = KuCoinClientWrapper()
-        trade_client = client.trade
         market_client = client.market
-        from core import wallet
-
-        base, quote = pair.split("-")
-
-        try:
-            all_symbols = market_client.get_symbol_list()
-        except requests.exceptions.ReadTimeout as e:
-            log_error(f"❌ Timeout bei KuCoin API – Symbol-Liste konnte nicht geladen werden: {e}")
-            from core.telegram_utils import send_telegram_message
-            send_telegram_message(f"❌ KuCoin TIMEOUT bei get_symbol_list() für {pair}")
-            return None
-        symbol_info = next((item for item in all_symbols if item['symbol'] == pair), None)
-        if symbol_info is None:
-            log_error(f"❌ Symbol-Info für {pair} nicht gefunden.")
-            return None
-        step_size = float(symbol_info['baseIncrement'])
-        min_size = float(symbol_info['baseMinSize'])
-
-        try:
-            account_data = wallet_instance.api.get_account_list()
-        except Exception as e:
-            log_error(f"❌ Fehler beim Abrufen der Kontenliste: {e}")
-            account_data = []
-        quote_balance = next((acc for acc in account_data if acc["currency"] == quote and acc["type"] == "trade"), None)
-        base_balance = next((acc for acc in account_data if acc["currency"] == base and acc["type"] == "trade"), None)
-
-        if quote_balance is None:
-            log_error(f"❌ Kein Trade-Konto für Quote-Währung {quote} gefunden.")
-            return None
-        if base_balance is None:
-            base_balance = {"available": "0.0"}
-
-        fee_rate = float(get_config("FEE_RATE", 0.001))
-        max_trade_usdt = float(get_config("MAX_TRADE_USDT", 9999))
-        min_order_value = float(get_config("MIN_ORDER_VALUE_USDT", 5))
-        position_size_percent_str = os.getenv("POSITION_SIZE_PERCENT", None)
-
-        if side == "buy":
-            available_funds = float(quote_balance["available"])
-
-            if position_size_percent_str is not None:
-                position_size_percent = float(position_size_percent_str) / 100.0
-                trade_value = min(available_funds * position_size_percent, max_trade_usdt)
-            else:
-                trade_value = min(available_funds, max_trade_usdt)
-
-            if trade_value < min_order_value:
-                log_error(f"❌ Trade-Wert {trade_value:.2f} USDT liegt unter Mindestgrenze ({min_order_value} USDT)")
-                return None
-
-            if not price:
-                ticker = market_client.get_ticker(pair)
-                price = float(ticker["price"])
-
-            quantity = (trade_value / price) * (1 - fee_rate)
-
-        elif side == "sell":
-            # --- Neue SELL-Order-Mengenberechnung laut Vorgabe ---
-            if side.lower() == "sell":
-                if position_manager is None:
-                    # Auto-initialize a LIVE PositionManager if caller didn't provide one
-                    from core.position import PositionManager as _PM
-                    position_manager = _PM(mode="LIVE")
-                    log_debug("ℹ️ position_manager fehlte im LIVE-Sell-Path – wurde automatisch initialisiert.")
-                # Zugriff auf Wallet-Instanz
-                from core import wallet as wallet_mod
-                position = position_manager.get_open_position(pair)
-                import logging
-                logger = logging.getLogger()
-                if not position:
-                    logger.warning(f"⚠️ Kein aktiver Trade für {pair} vorhanden – SELL wird übersprungen.")
-                    return
-                position_qty = float(position["quantity"])
-                available_qty = float(wallet_mod.wallet_instance.get_available_balance(base))
-                quantity = min(position_qty, available_qty)
-                quantity -= 0.0005  # Kleine Sicherheitsmarge zur Vermeidung von "Balance insufficient"
-                quantity = max(quantity, 0)
-                quantity = round(quantity, 6)
-                log_debug(f"🔎 Angepasste SELL-Menge für {pair}: {quantity}")
-                if quantity <= 0:
-                    raise ValueError("❌ Zu geringe verfügbare Menge für SELL-Order")
-
-            min_trade_qty = float(get_config("MIN_TRADE_QUANTITY", 0.0002))
-            if quantity < min_trade_qty:
-                log_error(f"❌ Nicht genug {base} zum Verkaufen. Verfügbar: {quantity:.8f}, benötigt > {min_trade_qty}")
-                return None
-
-        else:
-            log_error(f"❌ Ungültiger Order-Typ: {side}")
-            return None
-
-        quantity = (quantity // step_size) * step_size
-        quantity = round(quantity, 8)
-
-        if quantity < min_size:
-            log_error(f"❌ Ordergröße {quantity} zu klein für {pair} (min {min_size})")
-            return None
-
-        if DEBUG_MODE:
-            log_info(f"📦 Platzierung LIVE-Order: {side.upper()} {quantity} {pair} ...")
-        else:
-            log_info(f"📦 Platzierung LIVE-Order: {side.upper()} {quantity} {pair} ...")
-        if entry_reason:
-            if DEBUG_MODE:
-                log_info(f"📄 Entry-Grund: {entry_reason}")
-            else:
-                log_info(f"📄 Entry-Grund: {entry_reason}")
-        if DEBUG_MODE:
-            log_info(f"Orderdetails vor Ausführung: pair={pair}, side={side}, qty={quantity}, price={price}")
-
-        try:
-            response = run_with_timeout(
-                trade_client.create_market_order,
-                args=(pair, side),
-                kwargs={"size": quantity},
-                timeout=10
-            )
-        except TimeoutError as e:
-            log_error(f"❌ TIMEOUT bei KuCoin-Order: {e}")
-            from core.telegram_utils import send_telegram_message
-            send_telegram_message(f"❌ TIMEOUT bei Order {side.upper()} {pair}")
-            return None
-
-        if not response or "orderId" not in response:
-            log_error(f"❌ Ungültige API-Antwort: {response}")
-            return None
-
-        order_id = response["orderId"]
-        order_details = {}
-        if order_id:
-            # Retry a few times to allow KuCoin to populate deal fields
-            for _i in range(3):
-                try:
-                    od = trade_client.get_order_details(order_id)
-                    if isinstance(od, dict):
-                        order_details = od
-                    # Break if we have any fills or a known status
-                    deal_size_tmp = float((order_details.get("dealSize") or 0) or 0)
-                    status_tmp = str(order_details.get("status") or "").lower()
-                    if deal_size_tmp > 0 or status_tmp in ("done", "filled", "success", "finished"):
-                        break
-                except Exception as e:
-                    log_error(f"⚠️ Konnte Orderdetails nicht laden (BUY): {e}")
-                time.sleep(0.5)
-        else:
-            log_error("❌ Keine gültige Order-ID erhalten.")
-            order_details = {}
-
-        # Build initial order dict with safe fallbacks
-        order = {
-            "id": order_id,
-            "timestamp": int(time.time()),
-            "mode": "LIVE",
-            "symbol": pair,
-            "side": side.upper(),
-            "quantity": float(quantity),
-            "price": float(price) if price is not None else None,
-            "fee": 0.0,
-        }
-
-        # Try to update with actual fee and deal price once available
-        try:
-            fee_raw = order_details.get("fee") if isinstance(order_details, dict) else None
-            if fee_raw is not None:
-                order["fee"] = round(float(fee_raw), 8)
-            deal_size = float((order_details.get("dealSize") or 0) or 0) if isinstance(order_details, dict) else 0.0
-            deal_funds = float((order_details.get("dealFunds") or 0) or 0) if isinstance(order_details, dict) else 0.0
-            if deal_size > 0 and deal_funds > 0:
-                order["price"] = round(deal_funds / deal_size, 8)
-        except Exception as e:
-            log_error(f"⚠️ Fehler beim Verarbeiten der Orderdetails (BUY): {e}")
-
-        # Berechne SL/TP und PNL für den Trade
-        try:
-            entry_price_val = order.get("price") if side == "buy" else None
-            from strategies.atr import calculate_atr
-            atr_val = None
+        api = client  # pass the wrapper, which exposes trade/market methods used by send_order_prepared
+        if price is None:
             try:
-                try:
-                    kline_data = market_client.get_kline(pair, "15min")
-                    if isinstance(kline_data, str):
-                        import json
-                        kline_data = json.loads(kline_data)
-                    if not isinstance(kline_data, list):
-                        raise ValueError(f"Ungültiges Kline-Format: {type(kline_data)}")
-                except Exception as e:
-                    log_error(f"❌ Fehler beim Laden von Klines für ATR (angepasst): {e}")
-                    kline_data = []
-                import pandas as pd
-                df = pd.DataFrame(kline_data, columns=["time","open","close","high","low","volume","turnover"])
-                atr_val = calculate_atr(df)
-            except Exception as e:
-                log_error(f"❌ Fehler beim Laden von Klines für ATR: {e}")
-                atr_val = None
-            if entry_price_val is not None:
-                if USE_ATR_STOP and atr_val is not None and atr_val > 0:
-                    sl_val = round(entry_price_val - atr_val * ATR_MULTIPLIER_SL, 6)
-                    tp_val = round(entry_price_val + atr_val * ATR_MULTIPLIER_TP, 6)
-                else:
-                    sl_offset = float(get_config("TRAILING_SL_OFFSET", 0.005))
-                    tp_offset = float(get_config("TRAILING_TP_OFFSET", 0.02))
-                    sl_val = round(entry_price_val * (1 - sl_offset), 6)
-                    tp_val = round(entry_price_val * (1 + tp_offset), 6)
-                    # --- Mindest-SL/TP-Offsets, falls ATR zu klein oder nicht vorhanden ---
-                    min_sl_offset = float(get_config("MIN_SL_OFFSET", 0.01))
-                    min_tp_offset = float(get_config("MIN_TP_OFFSET", 0.03))
-                    sl_val = min(sl_val, entry_price_val * (1 - min_sl_offset))
-                    tp_val = max(tp_val, entry_price_val * (1 + min_tp_offset))
-            else:
-                sl_val = None
-                tp_val = None
-            order["entry_price"] = entry_price_val
-            order["sl"] = sl_val
-            order["tp"] = tp_val
-            order["pnl"] = 0.0
-            order["reason"] = entry_reason or "Manual/Signal Sell" if side == "sell" else entry_reason
-            # Trailing Stop-Loss aktivieren, falls konfiguriert
-            trailing_stop_enabled = get_config("TRAILING_STOP", "False").lower() == "true"
-            trailing_offset = float(get_config("TRAILING_SL_OFFSET", 0.005))
-            if trailing_stop_enabled and entry_price_val:
-                order["trailing_sl"] = round(entry_price_val * (1 - trailing_offset), 6)
-            else:
-                order["trailing_sl"] = None
-        except Exception as e:
-            log_error(f"❌ Fehler bei SL/TP/PNL-Berechnung: {e}")
-
-        from core.position import PositionManager
-        position_manager = PositionManager(mode="LIVE")
-        try:
-            if side == "buy":
-                # Pass entry_fee from order dict if available, use order["price"] if present, else fallback to price param
-                entry_fee = order["fee"] if order.get("fee") is not None else 0.0
-                if DEBUG_MODE:
-                    log_info(f"✅ Übergabe an save_position: fee={order.get('fee')}, entry_fee={entry_fee}")
-                position_manager.open(pair, quantity, order.get("price", price), fee=order.get("fee"), entry_fee=entry_fee)
-                # Telegram für BUY: Channel + Private
-                try:
-                    from core.telegram_utils import send_telegram_message
-                    entry_price = order.get("price", None)
-                    if entry_price is None and price is not None:
-                        entry_price = float(price)
-                    entry_str = f"{entry_price:.6f}" if entry_price is not None else "?"
-                    price_str = f"{entry_price:.5f}" if entry_price is not None else "?"
-                    fee_str = f"{order.get('fee', '?'):.6f}" if order.get('fee') is not None else "?"
-                    # Calculate SL/TP using ATR fallback (reuse PaperOrder logic)
-                    atr_val = None
-                    try:
-                        try:
-                            kline_data = market_client.get_kline(pair, "15min")
-                            if isinstance(kline_data, str):
-                                import json
-                                kline_data = json.loads(kline_data)
-                            if not isinstance(kline_data, list):
-                                raise ValueError(f"Ungültiges Kline-Format: {type(kline_data)}")
-                        except Exception as e:
-                            log_error(f"❌ Fehler beim Laden von Klines für ATR (angepasst): {e}")
-                            kline_data = []
-                        import pandas as pd
-                        df = pd.DataFrame(kline_data, columns=["time","open","close","high","low","volume","turnover"])
-                        atr_val = calculate_atr(df)
-                    except Exception as e:
-                        log_error(f"❌ Fehler beim Laden von Klines für ATR: {e}")
-                        atr_val = None
-                    if atr_val is None or atr_val <= 0:
-                        sl_val = round(entry_price * (1 - 0.05), 6)
-                        tp_val = round(entry_price * (1 + 0.12), 6)
-                    else:
-                        sl_val = round(entry_price - atr_val * float(get_config("ATR_MULTIPLIER_SL", 1.5)), 6)
-                        tp_val = round(entry_price + atr_val * float(get_config("ATR_MULTIPLIER_TP", 3.0)), 6)
-                    send_telegram_message(
-                        f"🟢 LIVE-ORDER\n"
-                        f"➡️ BUY {pair}\n"
-                        f"💰 Preis: {price_str}\n"
-                        f"📦 Menge: {quantity:.6f}\n"
-                        f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(order['timestamp']))}\n"
-                        f"🛑 Stop Loss: {sl_val}\n"
-                        f"🎯 Take Profit: {tp_val}\n",
-                        to_channel=True,
-                        to_private=True
-                    )
-                except Exception as e:
-                    log_error(f"❌ Fehler bei Telegram nach BUY: {str(e)}")
-            elif side == "sell":
-                # --- Fetch last BUY details for SELL ---
-                last_buy = None
-                try:
-                    from core.utils import load_json_file
-                    history = load_json_file("data/order_history.json")
-                    last_buy = find_last_matching_buy(pair, quantity, history)
-                except Exception as e:
-                    log_error(f"❌ Fehler beim Laden der letzten BUY-Order: {e}")
-                # Use position_manager first, fallback to last_buy
-                position = None
-                try:
-                    position = position_manager.get_open_position(pair)
-                except Exception as e:
-                    log_error(f"❌ Fehler beim Abrufen der offenen Position: {e}")
-                    position = None
-                entry_price = None
-                sl_val = None
-                tp_val = None
-                if position:
-                    entry_price = position.get("entry_price", None)
-                    sl_val = position.get("sl", None)
-                    tp_val = position.get("tp", None)
-                if (entry_price is None or entry_price == 0) and last_buy:
-                    entry_price = last_buy.get("price", None)
-                    sl_val = last_buy.get("sl", None)
-                    tp_val = last_buy.get("tp", None)
-                # If still None, calculate fallback SL/TP
-                if entry_price not in [None, 0] and (sl_val is None or tp_val is None):
-                    atr_val = None
-                    try:
-                        try:
-                            kline_data = market_client.get_kline(pair, "15min")
-                            if isinstance(kline_data, str):
-                                import json
-                                kline_data = json.loads(kline_data)
-                            if not isinstance(kline_data, list):
-                                raise ValueError(f"Ungültiges Kline-Format: {type(kline_data)}")
-                        except Exception as e:
-                            log_error(f"❌ Fehler beim Laden von Klines für ATR (angepasst): {e}")
-                            kline_data = []
-                        import pandas as pd
-                        df = pd.DataFrame(kline_data, columns=["time","open","close","high","low","volume","turnover"])
-                        atr_val = calculate_atr(df)
-                    except Exception as e:
-                        log_error(f"❌ Fehler beim Laden von Klines für ATR: {e}")
-                        atr_val = None
-                    if atr_val is None or atr_val <= 0:
-                        sl_val = round(entry_price * (1 - 0.05), 6)
-                        tp_val = round(entry_price * (1 + 0.12), 6)
-                    else:
-                        sl_val = round(entry_price - atr_val * float(get_config("ATR_MULTIPLIER_SL", 1.5)), 6)
-                        tp_val = round(entry_price + atr_val * float(get_config("ATR_MULTIPLIER_TP", 3.0)), 6)
-                order["entry_price"] = entry_price
-                order["sl"] = sl_val
-                order["tp"] = tp_val
-                # --- Prepare values for safe usage ---
-                price_val = order.get("price", None)
-                fee_val = order.get("fee", None)
-                # Defensive fallback: handle None and wrong types
-                def safe_float(val, default=0.0):
-                    try:
-                        if val is None:
-                            return default
-                        return float(val)
-                    except Exception:
-                        return default
-                price_val = safe_float(price_val, None)
-                fee_val = safe_float(fee_val, None)
-                entry_price_val = safe_float(entry_price, None)
-                # --- Profit Calculation with fallback ---
-                profit_str = "nicht berechenbar"
-                abs_pnl = None
-                pct_pnl = None
-                try:
-                    if entry_price_val not in [None, 0] and price_val not in [None, 0]:
-                        abs_pnl = (price_val - entry_price_val) * quantity
-                        pct_pnl = ((price_val - entry_price_val) / entry_price_val) * 100
-                        order["pnl"] = round(pct_pnl, 2)
-                        order["pnl_usdt"] = round(abs_pnl, 4)
-                        profit_str = f"{pct_pnl:+.2f}%"
-                except Exception as e:
-                    log_error(f"❌ Fehler bei Profit-Berechnung: {e}")
-                    profit_str = "nicht berechenbar"
-                # Format strings with fallback/defaults
-                try:
-                    price_str = f"{price_val:.5f}" if price_val not in [None, 0] else "?"
-                except Exception:
-                    price_str = "?"
-                try:
-                    fee_str = f"{fee_val:.6f}" if fee_val not in [None, 0] else "?"
-                except Exception:
-                    fee_str = "?"
-                try:
-                    entry_str = f"{entry_price_val:.6f}" if entry_price_val not in [None, 0] else "nicht verfügbar"
-                except Exception:
-                    entry_str = "nicht verfügbar"
-                # Ensure SL/TP are present in SELL notifications; fallback to min offsets if missing
-                if (sl_val in (None, 0) or tp_val in (None, 0)) and entry_price_val not in (None, 0):
-                    min_sl_offset = float(get_config("MIN_SL_OFFSET", 0.01))
-                    min_tp_offset = float(get_config("MIN_TP_OFFSET", 0.03))
-                    if sl_val in (None, 0):
-                        sl_val = round(entry_price_val * (1 - min_sl_offset), 6)
-                    if tp_val in (None, 0):
-                        tp_val = round(entry_price_val * (1 + min_tp_offset), 6)
-                # Format SL/TP as string with fallback
-                try:
-                    sl_val_str = f"{sl_val:.6f}" if sl_val not in [None, 0] else "?"
-                except Exception:
-                    sl_val_str = "?"
-                try:
-                    tp_val_str = f"{tp_val:.6f}" if tp_val not in [None, 0] else "?"
-                except Exception:
-                    tp_val_str = "?"
-                from core.telegram_utils import send_telegram_message
-                try:
-                    send_telegram_message(
-                        f"🔴 SELL Entry\n"
-                        f"Symbol: {pair}\n"
-                        f"Menge: {quantity:.6f}\n"
-                        f"Preis: {price_str}\n"
-                        f"Gebühr: {fee_str}\n"
-                        f"Entry: {entry_str}\n"
-                        f"Profit: {profit_str} | MODE: LIVE\n"
-                        f"🛑 Stop Loss: {sl_val_str}\n"
-                        f"🎯 Take Profit: {tp_val_str}\n",
-                        to_channel=True,
-                        to_private=True
-                    )
-                except Exception as e:
-                    log_error(f"❌ Fehler beim Senden der Telegram SELL-Nachricht: {e}")
-                # Teilverkäufe vorbereiten
-                partial_sells_enabled = get_config("ENABLE_PARTIAL_SELLS", "False").lower() == "true"
-                partial_sell_percent = float(get_config("PARTIAL_SELL_PERCENT", 0.5))
-                partial_sell_profit_threshold = float(get_config("PARTIAL_SELL_PROFIT_THRESHOLD", 0.01))
-                if partial_sells_enabled and entry_price and price_val:
-                    profit_ratio = (price_val - entry_price) / entry_price
-                    if profit_ratio >= partial_sell_profit_threshold:
-                        partial_qty = round(quantity * partial_sell_percent, 6)
-                        if partial_qty > 0:
-                            try:
-                                if DEBUG_MODE:
-                                    log_info(f"📉 Teilverkauf ausgelöst: {partial_qty} {pair} bei {price_val}")
-                                trade_client.create_market_order(pair, "sell", size=partial_qty)
-                                send_telegram_message(
-                                    f"📉 Teilverkauf ausgelöst\n"
-                                    f"Symbol: {pair}\n"
-                                    f"Menge: {partial_qty}\n"
-                                    f"Preis: {price_val}\n"
-                                    f"Gewinn: {profit_ratio*100:.2f}%\n",
-                                    to_channel=True,
-                                    to_private=True
-                                )
-                            except Exception as e:
-                                log_error(f"❌ Fehler bei Teilverkauf: {e}")
-                position_manager.close(pair)
-                if DEBUG_MODE:
-                    log_info(f"📁 Position in position_live.json für {pair} wurde geschlossen.")
-        except Exception as e:
-            log_error(f"❌ Fehler beim Aktualisieren der Position für {pair}: {str(e)}")
-            from core.telegram_utils import send_telegram_message
-            send_telegram_message(f"❌ Fehler beim Schreiben in position_live.json für {pair}: {str(e)}")
-
-        # Try to get the latest position for this symbol, if possible
-        position = None
-        try:
-            from core.position import PositionManager
-            pm = PositionManager(mode="LIVE")
-            position = pm.get_open_position(pair)
-        except Exception:
-            position = None
-        # --- Ensure essential fields are present before persisting ---
-        order["symbol"] = order.get("symbol") or pair
-        order["side"] = (order.get("side") or side).upper()
-        if order.get("price") is None and price is not None:
-            order["price"] = float(price)
-        if order.get("quantity") is None:
-            order["quantity"] = float(quantity)
-        # Ensure order dict retains entry_price, sl, tp, pnl, and trailing_sl before record_order
-        order["entry_price"] = order.get("entry_price") or order.get("price")
-        order["trailing_sl"] = order.get("trailing_sl")
-        record_order(order, position=position)
-        from core.performance import log_trade
-        log_trade(order)
-        try:
-            if side in ["buy", "sell"]:
-                notify_live_balance()
-        except Exception as e:
-            log_error(f"❌ Fehler in notify_live_balance: {str(e)}")
-
-        log_info(f"✅ LIVE-Order ausgeführt: {side.upper()} {quantity:.6f} {pair} (Fee: {order['fee']})")
-        
-        try:
-            auto_backup()
-        except Exception as e:
-            log_error(f"❌ Fehler beim automatischen Backup nach Order: {e}")
-        return order
-
+                tk = market_client.get_ticker(pair)
+                price = float(tk["price"])
+            except Exception:
+                price = 0.0
+        # quantity must be provided by caller (sizing handled upstream) – we keep the signature for compatibility.
+        if quantity in (None, 0):
+            from core.logger import log_error
+            log_error(f"❌ place_market_order_live: quantity fehlt/0 für {pair} {side}")
+            return None
+        # Delegate to unified sender (handles rounding, minFunds/minQty, idempotency, Telegram, history, positions)
+        return send_order_prepared(api, pair, side, price, quantity, strategy=entry_reason or "default", order_type="market")
     except Exception as e:
-        import traceback
-        log_error("❌ KuCoin API Fehler:")
-        log_error(f"Typ: {type(e)}")
-        log_error(f"Inhalt: {str(e)}")
-        log_error(traceback.format_exc())
-        from core.telegram_utils import send_telegram_message
-        send_telegram_message(f"❌ Order-Fehler ({side.upper()} {pair}): {str(e)}")
+        from core.logger import log_error
+        log_error(f"❌ Fehler in place_market_order_live (delegiert): {e}")
         return None
 
 import logging
@@ -1169,20 +842,6 @@ def place_order(symbol: str, side: str, quantity: float, price: float = None, mo
             order = place_market_order_live(symbol, side, quantity)
         if order and "id" in order:
             order_id = order["id"]
-        # --- Save to positions_live.json using merge_position_live ---
-        if order is not None and order_id is not None:
-            if side.lower() == "buy":
-                fee = float(order["fee"]) if order.get("fee") is not None else 0.0
-                timestamp = order.get("timestamp", int(time.time()))
-                merge_position_live(
-                    symbol=symbol,
-                    quantity=order.get("quantity", 0),
-                    price=order.get("price", 0),
-                    fee=fee,
-                    timestamp=timestamp,
-                    sl=order.get("sl"),
-                    tp=order.get("tp")
-                )
     return order
 
 # Korrigierte Version: Speichert Order-History als Liste von Dicts in order_history.json
